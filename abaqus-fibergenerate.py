@@ -1000,7 +1000,7 @@ if __name__ == "__main__":
         Lx_um=50.0,
         Ly_um=50.0,
 
-        target_vf=0.7250,
+        target_vf=0.70,
 
         diameter_mode="constant",
         diameter_mean_um=7.0,

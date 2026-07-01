@@ -9,6 +9,11 @@ dis[i,j] = random.uniform(lmin, lmax)
 This version does NOT use hexagonal initialization.
 It starts from random centers and uses growth-relaxation + random shaking.
 
+Modified version:
+1. Add optional Monte-Carlo legal shuffling after relaxation to reduce near-contact pile-up.
+2. Select several valid candidates using a randomness score instead of accepting the first valid layout.
+3. Compute pair distribution function by direct annulus counting instead of differentiating Ripley's K.
+
 Outputs:
 1. fiber_centers_main.csv
 2. fiber_centers_for_abaqus.csv
@@ -51,6 +56,34 @@ class RVEParams:
 
     random_shake_um: float = 0.08
     tol_um: float = 1.0e-7
+
+    # ------------------------------------------------------------
+    # Additional options for paper-like randomness evaluation
+    # ------------------------------------------------------------
+    # first_valid: accept the first valid geometry.
+    # best_valid_randomness: keep searching and select the valid geometry
+    # with the lowest randomness score. This is usually better for
+    # Pair distribution function.
+    selection_mode: str = "best_valid_randomness"
+    valid_candidates_to_test: int = 5
+
+    # After a valid geometry is found, randomly move fibers inside the
+    # feasible region. Only legal moves are accepted, so overlap constraints
+    # are never violated. This helps reduce the artificial pile-up at h/r≈2.
+    use_mc_shuffle: bool = True
+    mc_steps_per_fiber: int = 800
+    mc_move_amp_um: float = 0.06
+
+    # Pair distribution settings. Direct annulus counting is used.
+    pair_h_min_over_r: float = 2.0
+    pair_h_max_over_r: float = 15.0
+    pair_dh_over_r: float = 0.35
+    pair_smooth_window: int = 5
+
+    # Near-contact diagnostic interval. A very large fraction here usually
+    # explains an excessively high first peak of g(h).
+    contact_low_over_r: float = 2.0
+    contact_high_over_r: float = 2.10
 
     # seed=None means every run will use a new random seed based on current time.
     # Set seed to a fixed integer, e.g. 2026, when you want to reproduce exactly the same RVE.
@@ -292,6 +325,68 @@ def growth_relax(centers, radii, gap, p, rng):
 
     return centers
 
+
+
+# ============================================================
+# Monte-Carlo legal shuffling and candidate scoring
+# ============================================================
+
+def is_one_fiber_valid(k, centers, radii, gap, p):
+    """
+    Check whether fiber k satisfies all pairwise distance constraints.
+    Used by Monte-Carlo legal shuffling.
+    """
+    n = len(radii)
+    for j in range(n):
+        if j == k:
+            continue
+        d = distance(centers[k], centers[j], p)
+        required = radii[k] + radii[j] + gap[k, j]
+        if d < required - p.tol_um:
+            return False
+    return True
+
+
+def monte_carlo_shuffle(centers, radii, gap, p, rng,
+                        steps_per_fiber=None,
+                        move_amp_um=None):
+    """
+    Randomly perturb fibers after a valid layout has been obtained.
+
+    The move is accepted only if all distance constraints remain satisfied.
+    Therefore, this step cannot create fiber overlap or insufficient spacing.
+    Its purpose is to sample the feasible space more randomly and reduce the
+    near-contact pile-up produced by pure relaxation.
+    """
+    if steps_per_fiber is None:
+        steps_per_fiber = p.mc_steps_per_fiber
+    if move_amp_um is None:
+        move_amp_um = p.mc_move_amp_um
+
+    centers = centers.copy()
+    n = len(radii)
+    n_steps = int(max(0, steps_per_fiber) * n)
+
+    if n_steps <= 0 or move_amp_um <= 0.0:
+        return centers
+
+    accept = 0
+
+    for step in range(n_steps):
+        k = int(rng.integers(0, n))
+        old = centers[k].copy()
+
+        # Gaussian trial move. Periodic wrapping is applied immediately.
+        centers[k, 0] = (centers[k, 0] + rng.normal(0.0, move_amp_um)) % p.Lx_um
+        centers[k, 1] = (centers[k, 1] + rng.normal(0.0, move_amp_um)) % p.Ly_um
+
+        if is_one_fiber_valid(k, centers, radii, gap, p):
+            accept += 1
+        else:
+            centers[k] = old
+
+    print("MC shuffle: steps = %d, accept ratio = %.4f" % (n_steps, accept / max(n_steps, 1)))
+    return centers
 
 # ============================================================
 # Periodic copies for Abaqus
@@ -571,8 +666,8 @@ def evaluate_ripley_k(centers, p, h_min_over_r=2.0, h_max_over_r=15.0, n_h=120):
                 if dist[i, j] <= h:
                     count += 1
 
-        # ordered pair count, so denominator is N^2, same scale as common K estimator
-        K = area * count / float(n * n)
+        # ordered pair count. Common periodic estimator: A * count / [N * (N - 1)]
+        K = area * count / float(n * (n - 1))
         K_values.append(K)
 
     K_values = np.array(K_values)
@@ -612,6 +707,145 @@ def evaluate_pair_distribution_from_k(df_k):
 
     return df
 
+
+
+
+def evaluate_pair_distribution_shell(centers, radii, p,
+                                     h_min_over_r=None,
+                                     h_max_over_r=None,
+                                     dh_over_r=None,
+                                     smooth_window=None):
+    """
+    Pair distribution function by direct annulus counting.
+
+    This is more stable than differentiating the step-like Ripley's K curve,
+    especially for finite RVEs and high fiber volume fraction.
+
+    For a completely spatially random point process, g(h) = 1.
+    For high-Vf fibers, g(h) usually has a near-contact peak and then
+    oscillates around 1.
+    """
+    n = len(centers)
+    area = p.Lx_um * p.Ly_um
+    r_mean = float(np.mean(radii))
+
+    if h_min_over_r is None:
+        h_min_over_r = p.pair_h_min_over_r
+    if h_max_over_r is None:
+        h_max_over_r = p.pair_h_max_over_r
+    if dh_over_r is None:
+        dh_over_r = p.pair_dh_over_r
+    if smooth_window is None:
+        smooth_window = p.pair_smooth_window
+
+    h_min = h_min_over_r * r_mean
+    h_max = h_max_over_r * r_mean
+
+    # With minimum-image periodic distance, the reliable radius should not
+    # exceed half of the smaller side length.
+    h_limit = 0.5 * min(p.Lx_um, p.Ly_um)
+    h_max = min(h_max, h_limit)
+
+    if h_max <= h_min:
+        raise ValueError(
+            "h_max <= h_min. Increase the RVE size or reduce pair_h_max_over_r."
+        )
+
+    dist, _ = periodic_pairwise_distance_angle(centers, p)
+    pair_dist = dist[np.triu_indices(n, k=1)]  # unordered pairs, no double counting
+
+    dh = dh_over_r * r_mean
+    edges = np.arange(h_min, h_max + 0.5 * dh, dh)
+    if edges[-1] < h_max:
+        edges = np.append(edges, h_max)
+
+    count_unordered, _ = np.histogram(pair_dist, bins=edges)
+    h_center = 0.5 * (edges[:-1] + edges[1:])
+
+    shell_area = math.pi * (edges[1:] ** 2 - edges[:-1] ** 2)
+
+    # Expected unordered pair number for CSR inside each annulus.
+    # rho=(N-1)/A is used to be consistent with finite-N normalization.
+    rho = (n - 1) / area
+    expected_unordered = 0.5 * n * rho * shell_area
+
+    g_raw = count_unordered / np.maximum(expected_unordered, 1.0e-12)
+
+    if smooth_window is not None and smooth_window > 1:
+        g = pd.Series(g_raw).rolling(
+            window=int(smooth_window),
+            center=True,
+            min_periods=1
+        ).mean().values
+    else:
+        g = g_raw
+
+    df = pd.DataFrame({
+        "h_um": h_center,
+        "h_over_r": h_center / r_mean,
+        "count_unordered": count_unordered,
+        "g_raw": g_raw,
+        "g_algorithm": g,
+        "g_CSR": np.ones_like(g),
+        "g_minus_1": g - 1.0,
+    })
+
+    return df
+
+
+def contact_peak_diagnostics(centers, radii, p):
+    """
+    Count how many fiber pairs are located very close to h/r≈2.
+    A large value means the first peak of pair distribution will be high.
+    """
+    n = len(centers)
+    r_mean = float(np.mean(radii))
+    dist, _ = periodic_pairwise_distance_angle(centers, p)
+    pair_dist = dist[np.triu_indices(n, k=1)]
+    h_over_r = pair_dist / r_mean
+
+    low = p.contact_low_over_r
+    high = p.contact_high_over_r
+    count = int(np.sum((h_over_r >= low) & (h_over_r < high)))
+    total = int(len(h_over_r))
+    fraction = count / max(total, 1)
+
+    return {
+        "pair_total": total,
+        "min_h_over_r": float(np.min(h_over_r)),
+        "contact_interval_low": low,
+        "contact_interval_high": high,
+        "contact_pair_count": count,
+        "contact_pair_fraction": fraction,
+    }
+
+
+def layout_randomness_score(centers, radii, p):
+    """
+    A quick scalar score used to choose among several valid candidates.
+
+    The score is intentionally dominated by the direct pair-distribution RMSE
+    because the user's current problem is the excessive first peak of g(h).
+    """
+    df_g = evaluate_pair_distribution_shell(centers, radii, p)
+    df_ori = evaluate_nearest_neighbor_orientation(centers, p)
+    contact = contact_peak_diagnostics(centers, radii, p)
+
+    g_rmse = math.sqrt(np.mean((df_g["g_algorithm"].values - 1.0) ** 2))
+    orientation_ks = np.max(np.abs(df_ori["cdf_difference"].values))
+    contact_fraction = contact["contact_pair_fraction"]
+
+    # Weights are empirical. They favor reducing the excessive near-contact
+    # peak while still keeping orientation reasonably random.
+    score = g_rmse + 0.25 * orientation_ks + 20.0 * contact_fraction
+
+    return score, {
+        "score": score,
+        "pair_distribution_RMSE_shell": g_rmse,
+        "orientation_CDF_KS_distance": orientation_ks,
+        "contact_pair_fraction": contact_fraction,
+        "min_h_over_r": contact["min_h_over_r"],
+    }
 
 def plot_nearest_neighbor_distance(df_nn, save_path):
     plt.figure(figsize=(7, 5))
@@ -715,17 +949,22 @@ def plot_ripley_k(df_k, radii, save_path):
 def plot_pair_distribution(df_g, radii, save_path):
     r_mean = float(np.mean(radii))
 
+    if "h_over_r" in df_g.columns:
+        x = df_g["h_over_r"].values
+    else:
+        x = df_g["h_um"].values / r_mean
+
     plt.figure(figsize=(7, 5))
 
     plt.plot(
-        df_g["h_um"].values / r_mean,
+        x,
         df_g["g_algorithm"].values,
         linewidth=2.0,
         label="Generated RVE"
     )
 
     plt.plot(
-        df_g["h_um"].values / r_mean,
+        x,
         df_g["g_CSR"].values,
         linestyle="--",
         linewidth=2.0,
@@ -735,6 +974,12 @@ def plot_pair_distribution(df_g, radii, save_path):
     plt.xlabel("h / r")
     plt.ylabel("g(h)")
     plt.title("Pair distribution function")
+    plt.xlim(float(np.min(x)), float(np.max(x)))
+
+    # Keep the plot readable. The raw values are still saved in Excel.
+    ymax = max(3.0, min(8.0, 1.15 * float(np.nanmax(df_g["g_algorithm"].values))))
+    plt.ylim(0.0, ymax)
+
     plt.legend()
     plt.grid(True, linestyle="--", alpha=0.4)
     plt.tight_layout()
@@ -774,7 +1019,10 @@ def evaluate_randomness(centers, radii, p, output_prefix="fiber_centers"):
     )
 
     # 4. pair distribution function
-    df_g = evaluate_pair_distribution_from_k(df_k)
+    # Direct annulus counting is used because differentiating K(h) strongly
+    # amplifies finite-sample jumps near h/r≈2.
+    df_g = evaluate_pair_distribution_shell(centers, radii, p)
+    contact_diag = contact_peak_diagnostics(centers, radii, p)
 
     # Summary indices
     orientation_ks = np.max(np.abs(df_ori["cdf_difference"].values))
@@ -804,6 +1052,9 @@ def evaluate_randomness(centers, radii, p, output_prefix="fiber_centers"):
         "orientation_CDF_KS_distance": orientation_ks,
         "Ripley_K_relative_RMSE": k_rmse,
         "pair_distribution_RMSE": g_rmse,
+        "contact_pair_fraction": contact_diag["contact_pair_fraction"],
+        "contact_pair_count": contact_diag["contact_pair_count"],
+        "min_h_over_r": contact_diag["min_h_over_r"],
     }])
 
     # Save figures
@@ -848,6 +1099,8 @@ def evaluate_randomness(centers, radii, p, output_prefix="fiber_centers"):
     print("orientation CDF KS distance = %.6e" % orientation_ks)
     print("Ripley K relative RMSE      = %.6e" % k_rmse)
     print("pair distribution RMSE      = %.6e" % g_rmse)
+    print("contact pair fraction       = %.6e" % contact_diag["contact_pair_fraction"])
+    print("min h/r                     = %.6e" % contact_diag["min_h_over_r"])
     print("=" * 80)
 
     return summary, df_nn, df_ori, df_k, df_g
@@ -890,6 +1143,15 @@ def generate(p):
     best_centers = None
     best_gap = None
     best_metrics = None
+    best_score = None
+    best_score_info = None
+
+    # Backup for reporting if no valid layout is found.
+    best_invalid_centers = None
+    best_invalid_gap = None
+    best_invalid_metrics = None
+
+    valid_found = 0
 
     for restart in range(1, p.max_restarts + 1):
         print("\nrestart %03d starts..." % restart, flush=True)
@@ -898,7 +1160,6 @@ def generate(p):
         centers = random_initial_centers(p, n, rng)
 
         centers = growth_relax(centers, radii, gap, p, rng)
-
         metrics = compute_metrics(centers, radii, gap, p)
 
         print(
@@ -914,17 +1175,98 @@ def generate(p):
             )
         )
 
-        if best_metrics is None or metrics["energy"] < best_metrics["energy"]:
-            best_centers = centers.copy()
-            best_gap = gap.copy()
-            best_metrics = metrics.copy()
+        # Track the best invalid result only for debugging/failure report.
+        if best_invalid_metrics is None or metrics["energy"] < best_invalid_metrics["energy"]:
+            best_invalid_centers = centers.copy()
+            best_invalid_gap = gap.copy()
+            best_invalid_metrics = metrics.copy()
 
-        if metrics["max_overlap"] <= p.tol_um and metrics["max_violation"] <= p.tol_um:
-            print("\nAccepted random layout found.")
-            best_centers = centers.copy()
+        is_valid = (
+            metrics["max_overlap"] <= p.tol_um and
+            metrics["max_violation"] <= p.tol_um
+        )
+
+        if not is_valid:
+            continue
+
+        valid_found += 1
+        print("Valid candidate %d found." % valid_found)
+
+        candidate_centers = centers.copy()
+
+        if p.use_mc_shuffle:
+            candidate_centers = monte_carlo_shuffle(
+                candidate_centers,
+                radii,
+                gap,
+                p,
+                rng,
+                steps_per_fiber=p.mc_steps_per_fiber,
+                move_amp_um=p.mc_move_amp_um
+            )
+
+        candidate_metrics = compute_metrics(candidate_centers, radii, gap, p)
+
+        # Safety check after Monte-Carlo shuffle.
+        if (
+            candidate_metrics["max_overlap"] > p.tol_um or
+            candidate_metrics["max_violation"] > p.tol_um
+        ):
+            print("Warning: candidate became invalid after MC shuffle. It is skipped.")
+            continue
+
+        if p.selection_mode == "first_valid":
+            best_centers = candidate_centers.copy()
             best_gap = gap.copy()
-            best_metrics = metrics.copy()
+            best_metrics = candidate_metrics.copy()
+            best_score = 0.0
+            best_score_info = {"score": 0.0}
+            print("\nAccepted first valid layout.")
             break
+
+        candidate_score, candidate_score_info = layout_randomness_score(
+            candidate_centers,
+            radii,
+            p
+        )
+
+        print(
+            "candidate randomness score = %.6e | g_RMSE = %.6e | "
+            "contact_fraction = %.6e | min_h/r = %.6f"
+            % (
+                candidate_score_info["score"],
+                candidate_score_info["pair_distribution_RMSE_shell"],
+                candidate_score_info["contact_pair_fraction"],
+                candidate_score_info["min_h_over_r"],
+            )
+        )
+
+        if best_score is None or candidate_score < best_score:
+            best_centers = candidate_centers.copy()
+            best_gap = gap.copy()
+            best_metrics = candidate_metrics.copy()
+            best_score = candidate_score
+            best_score_info = candidate_score_info.copy()
+            print("This candidate is currently the best valid layout.")
+
+        if valid_found >= p.valid_candidates_to_test:
+            print("\nRequired number of valid candidates reached.")
+            break
+
+    # If no valid candidate survived the selection procedure, use the best
+    # invalid result for failure reporting.
+    if best_metrics is None:
+        best_centers = best_invalid_centers
+        best_gap = best_invalid_gap
+        best_metrics = best_invalid_metrics
+
+    if best_score_info is not None:
+        print("\nBest valid candidate score information:")
+        for key, value in best_score_info.items():
+            if isinstance(value, float):
+                print("  %s = %.6e" % (key, value))
+            else:
+                print("  %s = %s" % (key, value))
 
     if best_metrics["max_overlap"] > p.tol_um or best_metrics["max_violation"] > p.tol_um:
         print("\nGeneration failed.")
@@ -958,6 +1300,12 @@ def generate(p):
         "diameter_std_um": p.diameter_std_um,
         "lmin_um": p.lmin_um,
         "lmax_um": p.lmax_um,
+        "selection_mode": p.selection_mode,
+        "valid_candidates_found": valid_found,
+        "use_mc_shuffle": p.use_mc_shuffle,
+        "mc_steps_per_fiber": p.mc_steps_per_fiber,
+        "mc_move_amp_um": p.mc_move_amp_um,
+        "best_randomness_score": best_score,
         "min_surface_gap_um": best_metrics["min_surface_gap"],
         "min_constraint_margin_um": best_metrics["min_constraint_margin"],
         "max_overlap_um": best_metrics["max_overlap"],
@@ -997,17 +1345,23 @@ def generate(p):
 if __name__ == "__main__":
 
     params = RVEParams(
-        Lx_um=50.0,
-        Ly_um=50.0,
+        # 100 x 100 um gives much more stable statistics than 50 x 50 um.
+        # If you need the full h/r = 15 range strictly, 120 x 120 um is better.
+        Lx_um=100.0,
+        Ly_um=100.0,
 
-        target_vf=0.85,
+        target_vf=0.70,
 
-        diameter_mode="constant",
+        # Using a normal diameter distribution usually reduces the artificial
+        # near-contact peak compared with perfectly identical fibers.
+        diameter_mode="normal",
         diameter_mean_um=7.0,
         diameter_std_um=0.317,
 
-        # 80% 时必须用小间距
-        lmin_um=0.10,
+        # If you must use the exact narrow paper setting, change this back to
+        # 0.10-0.15. A wider gap interval helps avoid all near contacts being
+        # concentrated at the same h/r value.
+        lmin_um=0.1,
         lmax_um=0.15,
 
         max_restarts=200,
@@ -1016,15 +1370,31 @@ if __name__ == "__main__":
         relax_iter_per_step=1200,
         final_relax_iter=20000,
 
-        # 随机扰动强度，越大越随机，但越难收敛
+        # Random shaking during growth. Larger values keep more randomness
+        # but may make convergence harder.
         random_shake_um=0.08,
 
         tol_um=1.0e-7,
 
+        selection_mode="best_valid_randomness",
+        valid_candidates_to_test=5,
+
+        use_mc_shuffle=True,
+        mc_steps_per_fiber=800,
+        mc_move_amp_um=0.06,
+
+        pair_h_min_over_r=2.0,
+        pair_h_max_over_r=15.0,
+        pair_dh_over_r=0.35,
+        pair_smooth_window=5,
+
+        contact_low_over_r=2.0,
+        contact_high_over_r=2.10,
+
         # seed=None: every run generates a different RVE.
         # seed=2026: every run reproduces the same RVE.
-        seed=None,
-        output_prefix="fiber_centers"
+        seed=2026,
+        output_prefix="fiber_centers_100um_randomness_selected"
     )
 
     generate(params)
