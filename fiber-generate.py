@@ -1,30 +1,41 @@
 # -*- coding: utf-8 -*-
 """
-Generate random periodic fiber centers for high-Vf RVE.
+Paper-like random periodic RVE generator for continuous fiber reinforced composites.
 
-Key idea follows the paper:
-distance(i,j) >= ri + rj + dis[i,j]
-dis[i,j] = random.uniform(lmin, lmax)
+This script follows the workflow in Chen, Fu and Li (2026):
 
-This version does NOT use hexagonal initialization.
-It starts from random centers and uses growth-relaxation + random shaking.
+STEP 1. Establish a packing-optimization model and obtain initial fiber coordinates.
+        The paper solves the non-objective constrained model with DCCP:
+            (xi-xj)^2 + (yi-yj)^2 >= (ri+rj+dis[i,j])^2
+            dis[i,j] = random.uniform(lmin, lmax)
+        In this standalone script, the same constraints are imposed by a
+        penalty/relaxation optimizer. It is faster and more practical than the DCCP method for large periodic RVEs.
 
-Modified version:
-1. Add optional Monte-Carlo legal shuffling after relaxation to reduce near-contact pile-up.
-2. Select several valid candidates using a randomness score instead of accepting the first valid layout.
-3. Compute pair distribution function by direct annulus counting instead of differentiating Ripley's K.
+STEP 2. Re-orientation method.
+        Fibers are repeatedly tested for relocation into resin-rich positions.
+        A new position is accepted only if it satisfies all inter-fiber distance
+        constraints. This reduces fiber clustering and improves randomness.
+
+STEP 3. Periodic process for boundary fibers.
+        Boundary-intersecting fibers are copied to opposite sides/corners so
+        the exported geometry is periodic.
 
 Outputs:
-1. fiber_centers_main.csv
-2. fiber_centers_for_abaqus.csv
-3. fiber_centers.xlsx
-4. rve_preview.png
+    1. <prefix>_main.csv
+    2. <prefix>_for_abaqus.csv
+    3. <prefix>.xlsx
+    4. <prefix>_preview.png
+    5. <prefix>_randomness_evaluation.xlsx
+    6. four statistical figures similar to the paper
+
+Author: Chao Yang
 """
 
 import math
 import random
 import time
 from dataclasses import dataclass
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -34,113 +45,125 @@ from matplotlib.patches import Circle, Rectangle
 
 @dataclass
 class RVEParams:
-    Lx_um: float = 50.0
-    Ly_um: float = 50.0
+    # Geometry
+    Lx_um: float = 100.0
+    Ly_um: float = 100.0
+    target_vf: float = 0.70
 
-    target_vf: float = 0.80
-
+    # Fiber diameter distribution
+    # constant: all fibers have diameter_mean_um
+    # normal  : normal distribution, clipped by +/- 3 std
+    # uniform : uniform distribution between diameter_min_um and diameter_max_um
     diameter_mode: str = "constant"
     diameter_mean_um: float = 7.0
     diameter_std_um: float = 0.317
     diameter_min_um: float = 5.0
     diameter_max_um: float = 8.0
 
-    lmin_um: float = 0.10
-    lmax_um: float = 0.15
+    # Paper-like random inter-fiber distance constraint:
+    # dis[i,j] = random.uniform(lmin_um, lmax_um)
+    # Paper examples:
+    #   Vf = 60%, 65%: lmin = 0.175 um, lmax = 0.875 um
+    #   Vf = 70%     : lmin = 0.175 um, lmax = 0.350 um
+    #   Vf = 80%     : lmin = 0.100 um, lmax = 0.150 um
+    lmin_um: float = 0.175
+    lmax_um: float = 0.350
 
+    # Candidate search
     max_restarts: int = 200
+    valid_candidates_to_test: int = 5
+    selection_mode: str = "best_valid_randomness"  # first_valid or best_valid_randomness
 
-    growth_steps: int = 45
-    relax_iter_per_step: int = 1200
-    final_relax_iter: int = 20000
+    # STEP 1: packing optimization / feasibility relaxation
+    # These parameters replace the DCCP solver in a standalone SciPy-free manner.
+    opt_alpha_start: float = 0.25
+    opt_alpha_end: float = 1.0
+    opt_alpha_steps: int = 40
+    opt_iter_per_alpha: int = 800
+    opt_final_iter: int = 6000
+    opt_step_scale: float = 0.55
+    opt_move_limit_um: float = 0.25
+    opt_final_move_limit_um: float = 0.08
+    opt_random_shake_um: float = 0.06
 
-    random_shake_um: float = 0.08
+    # STEP 2: paper-like re-orientation
+    use_reorientation: bool = True
+    reorient_passes: int = 3
+    reorient_trials_per_fiber: int = 80
+    reorient_accept_if_improve_um: float = 0.02
+    reorient_random_accept_prob: float = 0.02
+    # Candidates are sampled partly globally and partly around resin-rich positions.
+    reorient_local_radius_factor: float = 4.0
+
+    # Optional Monte Carlo legal shuffle after reorientation.
+    # This is not the main paper step, but is useful for sampling feasible space.
+    use_mc_shuffle: bool = False
+    mc_steps_per_fiber: int = 300
+    mc_move_amp_um: float = 0.05
+
+    # Distance checking
+    use_periodic_distance: bool = True
     tol_um: float = 1.0e-7
 
-    # ------------------------------------------------------------
-    # Additional options for paper-like randomness evaluation
-    # ------------------------------------------------------------
-    # first_valid: accept the first valid geometry.
-    # best_valid_randomness: keep searching and select the valid geometry
-    # with the lowest randomness score. This is usually better for
-    # Pair distribution function.
-    selection_mode: str = "best_valid_randomness"
-    valid_candidates_to_test: int = 5
-
-    # After a valid geometry is found, randomly move fibers inside the
-    # feasible region. Only legal moves are accepted, so overlap constraints
-    # are never violated. This helps reduce the artificial pile-up at h/r≈2.
-    use_mc_shuffle: bool = True
-    mc_steps_per_fiber: int = 800
-    mc_move_amp_um: float = 0.06
-
-    # Pair distribution settings. Direct annulus counting is used.
+    # Randomness evaluation settings
     pair_h_min_over_r: float = 2.0
     pair_h_max_over_r: float = 15.0
     pair_dh_over_r: float = 0.35
-    pair_smooth_window: int = 5
-
-    # Near-contact diagnostic interval. A very large fraction here usually
-    # explains an excessively high first peak of g(h).
+    pair_smooth_window: int = 1  # 1 = no smoothing; set 5 for a smoother visual curve
     contact_low_over_r: float = 2.0
-    contact_high_over_r: float = 2.10
+    # This should usually be consistent with the first pair-distribution bin.
+    # If pair_h_min_over_r=2.0 and pair_dh_over_r=0.35, the first bin is 2.00-2.35.
+    contact_high_over_r: float = 2.35
 
-    # seed=None means every run will use a new random seed based on current time.
-    # Set seed to a fixed integer, e.g. 2026, when you want to reproduce exactly the same RVE.
-    seed: int = None
-    output_prefix: str = "fiber_centers"
+    # Reproducibility and output
+    seed: Optional[int] = 2026
+    output_prefix: str = "fiber_centers_paper_like"
 
 
 # ============================================================
 # Basic functions
 # ============================================================
 
-def estimate_fiber_number(p):
+def estimate_fiber_number(p: RVEParams) -> int:
     area = p.Lx_um * p.Ly_um
 
     if p.diameter_mode == "constant":
         r = p.diameter_mean_um / 2.0
         a = math.pi * r * r
-
     elif p.diameter_mode == "normal":
         mu = p.diameter_mean_um
         sig = p.diameter_std_um
         a = math.pi * (mu * mu + sig * sig) / 4.0
-
     elif p.diameter_mode == "uniform":
         d1 = p.diameter_min_um
         d2 = p.diameter_max_um
         mean_d2 = (d1 * d1 + d1 * d2 + d2 * d2) / 3.0
         a = math.pi * mean_d2 / 4.0
-
     else:
         raise ValueError("diameter_mode must be constant, normal, or uniform.")
 
     return int(round(p.target_vf * area / a))
 
 
-def generate_radii(p, n, rng):
+def generate_radii(p: RVEParams, n: int, rng: np.random.Generator) -> np.ndarray:
     if p.diameter_mode == "constant":
         d = np.ones(n) * p.diameter_mean_um
-
     elif p.diameter_mode == "normal":
         d = rng.normal(p.diameter_mean_um, p.diameter_std_um, n)
         d = np.clip(
             d,
             p.diameter_mean_um - 3.0 * p.diameter_std_um,
-            p.diameter_mean_um + 3.0 * p.diameter_std_um
+            p.diameter_mean_um + 3.0 * p.diameter_std_um,
         )
-
     elif p.diameter_mode == "uniform":
         d = rng.uniform(p.diameter_min_um, p.diameter_max_um, n)
-
     else:
         raise ValueError("diameter_mode must be constant, normal, or uniform.")
 
     return d / 2.0
 
 
-def make_gap_matrix(p, n, rng):
+def make_gap_matrix(p: RVEParams, n: int, rng: np.random.Generator) -> np.ndarray:
     gap = rng.uniform(p.lmin_um, p.lmax_um, (n, n))
     gap = np.triu(gap, 1)
     gap = gap + gap.T
@@ -148,141 +171,165 @@ def make_gap_matrix(p, n, rng):
     return gap
 
 
-def actual_vf(radii, p):
+def actual_vf(radii: np.ndarray, p: RVEParams) -> float:
     return float(np.sum(math.pi * radii ** 2) / (p.Lx_um * p.Ly_um))
 
 
-def min_image(dx, dy, p):
-    dx -= p.Lx_um * round(dx / p.Lx_um)
-    dy -= p.Ly_um * round(dy / p.Ly_um)
+def min_image_components(dx: np.ndarray, dy: np.ndarray, p: RVEParams) -> Tuple[np.ndarray, np.ndarray]:
+    if p.use_periodic_distance:
+        dx = dx - p.Lx_um * np.round(dx / p.Lx_um)
+        dy = dy - p.Ly_um * np.round(dy / p.Ly_um)
     return dx, dy
 
 
-def distance(c1, c2, p):
+def min_image(dx: float, dy: float, p: RVEParams) -> Tuple[float, float]:
+    if p.use_periodic_distance:
+        dx -= p.Lx_um * round(dx / p.Lx_um)
+        dy -= p.Ly_um * round(dy / p.Ly_um)
+    return dx, dy
+
+
+def distance(c1: np.ndarray, c2: np.ndarray, p: RVEParams) -> float:
     dx = c1[0] - c2[0]
     dy = c1[1] - c2[1]
     dx, dy = min_image(dx, dy, p)
     return math.sqrt(dx * dx + dy * dy)
 
 
-def random_initial_centers(p, n, rng):
-    centers = np.zeros((n, 2))
+def random_initial_centers(p: RVEParams, n: int, rng: np.random.Generator) -> np.ndarray:
+    centers = np.zeros((n, 2), dtype=float)
     centers[:, 0] = rng.uniform(0.0, p.Lx_um, n)
     centers[:, 1] = rng.uniform(0.0, p.Ly_um, n)
     return centers
 
 
+def pair_indices(n: int) -> Tuple[np.ndarray, np.ndarray]:
+    return np.triu_indices(n, k=1)
+
+
 # ============================================================
-# Check functions
+# Metrics and validation
 # ============================================================
 
-def compute_metrics(centers, radii, gap, p):
+def compute_metrics(centers: np.ndarray, radii: np.ndarray, gap: np.ndarray, p: RVEParams) -> Dict[str, float]:
     n = len(radii)
+    ii, jj = pair_indices(n)
 
-    min_surface_gap = 1.0e30
-    min_constraint_margin = 1.0e30
-    max_overlap = 0.0
-    max_violation = 0.0
-    energy = 0.0
+    dx = centers[ii, 0] - centers[jj, 0]
+    dy = centers[ii, 1] - centers[jj, 1]
+    dx, dy = min_image_components(dx, dy, p)
+    d = np.sqrt(dx * dx + dy * dy)
 
-    for i in range(n):
-        for j in range(i + 1, n):
-            d = distance(centers[i], centers[j], p)
+    required_surface = radii[ii] + radii[jj]
+    required_constraint = required_surface + gap[ii, jj]
 
-            surface_gap = d - radii[i] - radii[j]
-            required = radii[i] + radii[j] + gap[i, j]
-            margin = d - required
-
-            min_surface_gap = min(min_surface_gap, surface_gap)
-            min_constraint_margin = min(min_constraint_margin, margin)
-
-            if surface_gap < 0.0:
-                max_overlap = max(max_overlap, -surface_gap)
-
-            if margin < 0.0:
-                v = -margin
-                max_violation = max(max_violation, v)
-                energy += v * v
+    surface_gap = d - required_surface
+    margin = d - required_constraint
+    violation = np.maximum(-margin, 0.0)
+    overlap = np.maximum(-surface_gap, 0.0)
 
     return {
-        "min_surface_gap": min_surface_gap,
-        "min_constraint_margin": min_constraint_margin,
-        "max_overlap": max_overlap,
-        "max_violation": max_violation,
-        "energy": energy,
+        "min_surface_gap": float(np.min(surface_gap)),
+        "min_constraint_margin": float(np.min(margin)),
+        "max_overlap": float(np.max(overlap)),
+        "max_violation": float(np.max(violation)),
+        "energy": float(np.sum(violation * violation)),
     }
 
 
-def get_bad_pairs(centers, radii, gap, p):
+def get_bad_pairs(centers: np.ndarray, radii: np.ndarray, gap: np.ndarray, p: RVEParams):
     bad = []
     n = len(radii)
-
     for i in range(n):
         for j in range(i + 1, n):
             d = distance(centers[i], centers[j], p)
             required = radii[i] + radii[j] + gap[i, j]
-
             if d < required - p.tol_um:
                 bad.append((i + 1, j + 1, d, required, required - d))
-
     return bad
 
 
 # ============================================================
-# Random growth relaxation
+# STEP 1: paper-like packing optimization
 # ============================================================
 
-def relax_one_stage(centers, radii, gap, p, rng, alpha, n_iter, shake_amp):
+def packing_relax_one_stage(
+    centers: np.ndarray,
+    radii: np.ndarray,
+    gap: np.ndarray,
+    p: RVEParams,
+    rng: np.random.Generator,
+    alpha: float,
+    n_iter: int,
+    shake_amp: float,
+    move_limit_um: float,
+) -> np.ndarray:
     """
-    alpha gradually increases from small value to 1.0.
-    required distance = alpha * (ri + rj + disij)
+    Penalty/relaxation solution of the paper's non-objective constraint model.
+
+    The paper uses DCCP to solve:
+        d_ij >= r_i + r_j + dis[i,j]
+    Here we impose the same inequality by iteratively separating only the pairs
+    that violate it. alpha gradually increases from opt_alpha_start to 1.0.
     """
     centers = centers.copy()
     n = len(radii)
+    ii, jj = pair_indices(n)
 
-    for it in range(n_iter):
+    for _ in range(int(n_iter)):
+        dx = centers[ii, 0] - centers[jj, 0]
+        dy = centers[ii, 1] - centers[jj, 1]
+        dx, dy = min_image_components(dx, dy, p)
+        d = np.sqrt(dx * dx + dy * dy)
+
+        required = alpha * (radii[ii] + radii[jj] + gap[ii, jj])
+        violation = required - d
+        mask = violation > 0.0
+
+        if not np.any(mask):
+            if shake_amp <= 0.0:
+                break
+            # Continue a little randomness only during early alpha stages.
+            centers[:, 0] = (centers[:, 0] + rng.normal(0.0, shake_amp, n)) % p.Lx_um
+            centers[:, 1] = (centers[:, 1] + rng.normal(0.0, shake_amp, n)) % p.Ly_um
+            continue
+
+        mi = ii[mask]
+        mj = jj[mask]
+        mdx = dx[mask]
+        mdy = dy[mask]
+        md = d[mask]
+        mv = violation[mask]
+
+        # Direction for pairs with exactly zero distance.
+        zero = md < 1.0e-12
+        if np.any(zero):
+            theta = rng.uniform(0.0, 2.0 * math.pi, np.sum(zero))
+            mdx[zero] = np.cos(theta)
+            mdy[zero] = np.sin(theta)
+            md[zero] = 1.0
+
+        nx = mdx / md
+        ny = mdy / md
+
+        # Move each pair half of the violating distance in opposite directions.
+        f = 0.5 * mv * p.opt_step_scale
+        fx = nx * f
+        fy = ny * f
+
         force = np.zeros_like(centers)
-        max_v = 0.0
+        np.add.at(force[:, 0], mi, fx)
+        np.add.at(force[:, 1], mi, fy)
+        np.add.at(force[:, 0], mj, -fx)
+        np.add.at(force[:, 1], mj, -fy)
 
-        for i in range(n):
-            for j in range(i + 1, n):
-                dx = centers[i, 0] - centers[j, 0]
-                dy = centers[i, 1] - centers[j, 1]
-                dx, dy = min_image(dx, dy, p)
+        norm = np.sqrt(force[:, 0] ** 2 + force[:, 1] ** 2)
+        too_large = norm > move_limit_um
+        if np.any(too_large):
+            force[too_large, :] *= (move_limit_um / norm[too_large])[:, None]
 
-                d = math.sqrt(dx * dx + dy * dy)
-                required = alpha * (radii[i] + radii[j] + gap[i, j])
-                v = required - d
+        centers += force
 
-                if v > 0.0:
-                    max_v = max(max_v, v)
-
-                    if d < 1.0e-12:
-                        theta = rng.uniform(0.0, 2.0 * math.pi)
-                        nx = math.cos(theta)
-                        ny = math.sin(theta)
-                    else:
-                        nx = dx / d
-                        ny = dy / d
-
-                    # Repulsive force
-                    f = 0.5 * v
-                    force[i, 0] += nx * f
-                    force[i, 1] += ny * f
-                    force[j, 0] -= nx * f
-                    force[j, 1] -= ny * f
-
-        # limit each move
-        step_limit = 0.30 if alpha < 0.9 else 0.10
-        move_norm = np.sqrt(np.sum(force * force, axis=1))
-
-        for k in range(n):
-            if move_norm[k] > step_limit:
-                force[k, :] *= step_limit / move_norm[k]
-
-        centers += 0.55 * force
-
-        # random shaking: keep randomness, avoid hex locking
         if shake_amp > 0.0:
             centers[:, 0] += rng.normal(0.0, shake_amp, n)
             centers[:, 1] += rng.normal(0.0, shake_amp, n)
@@ -290,111 +337,206 @@ def relax_one_stage(centers, radii, gap, p, rng, alpha, n_iter, shake_amp):
         centers[:, 0] = centers[:, 0] % p.Lx_um
         centers[:, 1] = centers[:, 1] % p.Ly_um
 
-        if max_v < p.tol_um:
-            break
-
     return centers
 
 
-def growth_relax(centers, radii, gap, p, rng):
-    """
-    Start from random distribution.
-    Gradually grow required distance.
-    """
-    alphas = np.linspace(0.25, 1.0, p.growth_steps)
+def paper_step1_initial_optimization(
+    centers: np.ndarray,
+    radii: np.ndarray,
+    gap: np.ndarray,
+    p: RVEParams,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    print("STEP 1: packing-optimization feasibility relaxation starts...")
+    alphas = np.linspace(p.opt_alpha_start, p.opt_alpha_end, p.opt_alpha_steps)
 
     for k, alpha in enumerate(alphas):
-        # shaking decreases during growth
         frac = 1.0 - float(k) / float(max(len(alphas) - 1, 1))
-        shake = p.random_shake_um * frac
-
-        centers = relax_one_stage(
+        shake = p.opt_random_shake_um * frac
+        centers = packing_relax_one_stage(
             centers, radii, gap, p, rng,
             alpha=float(alpha),
-            n_iter=p.relax_iter_per_step,
-            shake_amp=shake
+            n_iter=p.opt_iter_per_alpha,
+            shake_amp=shake,
+            move_limit_um=p.opt_move_limit_um,
         )
 
-    # final polishing without shaking
-    centers = relax_one_stage(
+    # Final polishing at alpha=1.0 without random shaking.
+    centers = packing_relax_one_stage(
         centers, radii, gap, p, rng,
         alpha=1.0,
-        n_iter=p.final_relax_iter,
-        shake_amp=0.0
+        n_iter=p.opt_final_iter,
+        shake_amp=0.0,
+        move_limit_um=p.opt_final_move_limit_um,
     )
 
     return centers
 
 
-
 # ============================================================
-# Monte-Carlo legal shuffling and candidate scoring
+# STEP 2: paper-like re-orientation method
 # ============================================================
 
-def is_one_fiber_valid(k, centers, radii, gap, p):
-    """
-    Check whether fiber k satisfies all pairwise distance constraints.
-    Used by Monte-Carlo legal shuffling.
-    """
+def single_fiber_min_margin(k: int, trial_xy: np.ndarray, centers: np.ndarray,
+                            radii: np.ndarray, gap: np.ndarray, p: RVEParams) -> float:
+    """Minimum constraint margin of one trial position against all other fibers."""
     n = len(radii)
-    for j in range(n):
-        if j == k:
-            continue
-        d = distance(centers[k], centers[j], p)
-        required = radii[k] + radii[j] + gap[k, j]
-        if d < required - p.tol_um:
-            return False
-    return True
+    dx = trial_xy[0] - centers[:, 0]
+    dy = trial_xy[1] - centers[:, 1]
+    dx, dy = min_image_components(dx, dy, p)
+    d = np.sqrt(dx * dx + dy * dy)
+    d[k] = np.inf
+    required = radii[k] + radii + gap[k, :]
+    required[k] = 0.0
+    margin = d - required
+    return float(np.min(margin))
 
 
-def monte_carlo_shuffle(centers, radii, gap, p, rng,
-                        steps_per_fiber=None,
-                        move_amp_um=None):
+def is_one_fiber_valid(k: int, centers: np.ndarray, radii: np.ndarray, gap: np.ndarray, p: RVEParams) -> bool:
+    margin = single_fiber_min_margin(k, centers[k], centers, radii, gap, p)
+    return margin >= -p.tol_um
+
+
+def estimate_resin_rich_points(centers: np.ndarray, radii: np.ndarray, p: RVEParams,
+                               rng: np.random.Generator, n_points: int = 2000,
+                               keep: int = 50) -> np.ndarray:
     """
-    Randomly perturb fibers after a valid layout has been obtained.
-
-    The move is accepted only if all distance constraints remain satisfied.
-    Therefore, this step cannot create fiber overlap or insufficient spacing.
-    Its purpose is to sample the feasible space more randomly and reduce the
-    near-contact pile-up produced by pure relaxation.
+    Sample random points and keep those farthest from existing fiber surfaces.
+    These points are used as resin-rich search centers in Step 2.
     """
-    if steps_per_fiber is None:
-        steps_per_fiber = p.mc_steps_per_fiber
-    if move_amp_um is None:
-        move_amp_um = p.mc_move_amp_um
+    pts = np.zeros((n_points, 2), dtype=float)
+    pts[:, 0] = rng.uniform(0.0, p.Lx_um, n_points)
+    pts[:, 1] = rng.uniform(0.0, p.Ly_um, n_points)
+
+    best_surface_gap = np.empty(n_points, dtype=float)
+    for a in range(n_points):
+        dx = pts[a, 0] - centers[:, 0]
+        dy = pts[a, 1] - centers[:, 1]
+        dx, dy = min_image_components(dx, dy, p)
+        d = np.sqrt(dx * dx + dy * dy)
+        best_surface_gap[a] = np.min(d - radii)
+
+    idx = np.argsort(best_surface_gap)[-min(keep, n_points):]
+    return pts[idx]
+
+
+def paper_step2_reorientation(
+    centers: np.ndarray,
+    radii: np.ndarray,
+    gap: np.ndarray,
+    p: RVEParams,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """
+    Re-orientation method in the spirit of the paper.
+
+    For each fiber, candidate positions are searched in resin-rich regions.
+    A candidate is acceptable only if it satisfies all inter-fiber distance
+    constraints. It is accepted if it improves the local minimum margin, with a
+    small probability of random legal acceptance to avoid over-regularization.
+    """
+    if not p.use_reorientation:
+        return centers
+
+    print("STEP 2: re-orientation method starts...")
+    centers = centers.copy()
+    n = len(radii)
+    local_sigma = p.reorient_local_radius_factor * float(np.mean(radii))
+
+    for pass_id in range(1, p.reorient_passes + 1):
+        resin_points = estimate_resin_rich_points(
+            centers, radii, p, rng,
+            n_points=max(1000, 8 * n),
+            keep=max(30, n // 5),
+        )
+
+        order = rng.permutation(n)
+        moved = 0
+
+        for k in order:
+            old_xy = centers[k].copy()
+            old_margin = single_fiber_min_margin(k, old_xy, centers, radii, gap, p)
+            best_xy = old_xy.copy()
+            best_margin = old_margin
+
+            for _ in range(p.reorient_trials_per_fiber):
+                if rng.random() < 0.65 and len(resin_points) > 0:
+                    base = resin_points[int(rng.integers(0, len(resin_points)))]
+                    trial = base + rng.normal(0.0, local_sigma, 2)
+                    trial[0] = trial[0] % p.Lx_um
+                    trial[1] = trial[1] % p.Ly_um
+                else:
+                    trial = np.array([
+                        rng.uniform(0.0, p.Lx_um),
+                        rng.uniform(0.0, p.Ly_um),
+                    ])
+
+                margin = single_fiber_min_margin(k, trial, centers, radii, gap, p)
+                if margin >= -p.tol_um and margin > best_margin:
+                    best_xy = trial.copy()
+                    best_margin = margin
+
+            legal_improvement = best_margin >= old_margin + p.reorient_accept_if_improve_um
+            legal_random = best_margin >= -p.tol_um and rng.random() < p.reorient_random_accept_prob
+
+            if legal_improvement or legal_random:
+                centers[k] = best_xy
+                moved += 1
+
+        metrics = compute_metrics(centers, radii, gap, p)
+        print(
+            "  pass %d/%d | moved = %d | min_margin = %.6e | max_violation = %.6e"
+            % (pass_id, p.reorient_passes, moved,
+               metrics["min_constraint_margin"], metrics["max_violation"])
+        )
+
+        if metrics["max_violation"] > p.tol_um:
+            # The move logic should prevent this, but polish if numerical noise appears.
+            centers = packing_relax_one_stage(
+                centers, radii, gap, p, rng,
+                alpha=1.0,
+                n_iter=1000,
+                shake_amp=0.0,
+                move_limit_um=p.opt_final_move_limit_um,
+            )
+
+    return centers
+
+
+# ============================================================
+# Optional legal Monte Carlo shuffle
+# ============================================================
+
+def monte_carlo_shuffle(centers: np.ndarray, radii: np.ndarray, gap: np.ndarray,
+                        p: RVEParams, rng: np.random.Generator) -> np.ndarray:
+    if not p.use_mc_shuffle or p.mc_steps_per_fiber <= 0 or p.mc_move_amp_um <= 0.0:
+        return centers
 
     centers = centers.copy()
     n = len(radii)
-    n_steps = int(max(0, steps_per_fiber) * n)
-
-    if n_steps <= 0 or move_amp_um <= 0.0:
-        return centers
-
+    n_steps = int(p.mc_steps_per_fiber * n)
     accept = 0
 
-    for step in range(n_steps):
+    for _ in range(n_steps):
         k = int(rng.integers(0, n))
         old = centers[k].copy()
-
-        # Gaussian trial move. Periodic wrapping is applied immediately.
-        centers[k, 0] = (centers[k, 0] + rng.normal(0.0, move_amp_um)) % p.Lx_um
-        centers[k, 1] = (centers[k, 1] + rng.normal(0.0, move_amp_um)) % p.Ly_um
-
+        centers[k, 0] = (centers[k, 0] + rng.normal(0.0, p.mc_move_amp_um)) % p.Lx_um
+        centers[k, 1] = (centers[k, 1] + rng.normal(0.0, p.mc_move_amp_um)) % p.Ly_um
         if is_one_fiber_valid(k, centers, radii, gap, p):
             accept += 1
         else:
             centers[k] = old
 
-    print("MC shuffle: steps = %d, accept ratio = %.4f" % (n_steps, accept / max(n_steps, 1)))
+    print("Optional MC shuffle: steps = %d, accept ratio = %.4f" % (n_steps, accept / max(n_steps, 1)))
     return centers
 
+
 # ============================================================
-# Periodic copies for Abaqus
+# STEP 3: periodic copies for Abaqus geometry
 # ============================================================
 
-def build_main_dataframe(centers, radii):
+def build_main_dataframe(centers: np.ndarray, radii: np.ndarray) -> pd.DataFrame:
     rows = []
-
     for i, (c, r) in enumerate(zip(centers, radii), start=1):
         rows.append({
             "id": i,
@@ -407,11 +549,10 @@ def build_main_dataframe(centers, radii):
             "r_mm": r / 1000.0,
             "diameter_mm": 2.0 * r / 1000.0,
         })
-
     return pd.DataFrame(rows)
 
 
-def build_for_abaqus_dataframe(centers, radii, p):
+def build_for_abaqus_dataframe(centers: np.ndarray, radii: np.ndarray, p: RVEParams) -> pd.DataFrame:
     rows = []
     new_id = 1
 
@@ -443,7 +584,6 @@ def build_for_abaqus_dataframe(centers, radii, p):
             shift_x.append(p.Lx_um)
         if x + r > p.Lx_um:
             shift_x.append(-p.Lx_um)
-
         if y - r < 0.0:
             shift_y.append(p.Ly_um)
         if y + r > p.Ly_um:
@@ -453,10 +593,8 @@ def build_for_abaqus_dataframe(centers, radii, p):
             for sy in shift_y:
                 if abs(sx) < 1.0e-12 and abs(sy) < 1.0e-12:
                     continue
-
                 xx = x + sx
                 yy = y + sy
-
                 rows.append({
                     "id": new_id,
                     "parent_id": i,
@@ -478,309 +616,130 @@ def build_for_abaqus_dataframe(centers, radii, p):
 
 
 # ============================================================
-# Plot
-# ============================================================
-
-def plot_rve(df_for_abaqus, p, save_path="rve_preview.png"):
-    fig, ax = plt.subplots(figsize=(7, 7))
-
-    ax.add_patch(Rectangle((0, 0), p.Lx_um, p.Ly_um, fill=False, linewidth=2.0))
-
-    for _, row in df_for_abaqus.iterrows():
-        alpha = 0.35 if bool(row["is_periodic_copy"]) else 0.75
-
-        ax.add_patch(
-            Circle(
-                (row["x_um"], row["y_um"]),
-                row["r_um"],
-                fill=True,
-                alpha=alpha,
-                linewidth=0.6
-            )
-        )
-
-    ax.set_aspect("equal")
-    ax.set_xlim(-0.1 * p.Lx_um, 1.1 * p.Lx_um)
-    ax.set_ylim(-0.1 * p.Ly_um, 1.1 * p.Ly_um)
-    ax.set_xlabel("x / μm")
-    ax.set_ylabel("y / μm")
-    ax.set_title("Random periodic RVE, target Vf = %.3f" % p.target_vf)
-    ax.grid(True, linestyle="--", alpha=0.4)
-
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=300)
-    plt.show()
-
-
-def plot_failed(centers, radii, gap, p):
-    fig, ax = plt.subplots(figsize=(7, 7))
-    ax.add_patch(Rectangle((0, 0), p.Lx_um, p.Ly_um, fill=False, linewidth=2.0))
-
-    for c, r in zip(centers, radii):
-        ax.add_patch(Circle((c[0], c[1]), r, fill=True, alpha=0.6))
-
-    bad = get_bad_pairs(centers, radii, gap, p)
-
-    for item in bad[:30]:
-        i = item[0] - 1
-        j = item[1] - 1
-        ax.plot([centers[i, 0], centers[j, 0]],
-                [centers[i, 1], centers[j, 1]], linewidth=1.2)
-
-    ax.set_aspect("equal")
-    ax.set_xlim(-0.1 * p.Lx_um, 1.1 * p.Lx_um)
-    ax.set_ylim(-0.1 * p.Ly_um, 1.1 * p.Ly_um)
-    ax.set_title("Failed layout")
-    ax.grid(True, linestyle="--", alpha=0.4)
-
-    plt.tight_layout()
-    plt.savefig("failed_layout.png", dpi=300)
-    plt.show()
-# ============================================================
 # Randomness evaluation, similar to the paper
 # ============================================================
 
-def periodic_pairwise_distance_angle(centers, p):
-    """
-    Calculate periodic pairwise distance and angle matrix.
-
-    distance: center-to-center distance under minimum-image convention
-    angle   : angle from fiber i to fiber j, degree, range [0, 360)
-    """
+def periodic_pairwise_distance_angle(centers: np.ndarray, p: RVEParams) -> Tuple[np.ndarray, np.ndarray]:
     n = len(centers)
     dist = np.zeros((n, n), dtype=float)
     angle = np.zeros((n, n), dtype=float)
 
     for i in range(n):
-        for j in range(n):
-            if i == j:
-                dist[i, j] = np.inf
-                angle[i, j] = np.nan
-                continue
-
-            dx = centers[j, 0] - centers[i, 0]
-            dy = centers[j, 1] - centers[i, 1]
-
-            # periodic minimum image
-            dx -= p.Lx_um * round(dx / p.Lx_um)
-            dy -= p.Ly_um * round(dy / p.Ly_um)
-
-            d = math.sqrt(dx * dx + dy * dy)
-            theta = math.degrees(math.atan2(dy, dx))
-
-            if theta < 0.0:
-                theta += 360.0
-
-            dist[i, j] = d
-            angle[i, j] = theta
+        dx = centers[:, 0] - centers[i, 0]
+        dy = centers[:, 1] - centers[i, 1]
+        dx, dy = min_image_components(dx, dy, p)
+        d = np.sqrt(dx * dx + dy * dy)
+        theta = np.degrees(np.arctan2(dy, dx))
+        theta = np.where(theta < 0.0, theta + 360.0, theta)
+        d[i] = np.inf
+        theta[i] = np.nan
+        dist[i, :] = d
+        angle[i, :] = theta
 
     return dist, angle
 
 
-def evaluate_nearest_neighbor_distance(centers, radii, p):
-    """
-    Evaluate 1st, 2nd, and 3rd nearest-neighbor distances.
-    The paper plots h/r, so here distances are normalized by mean radius.
-    """
-    dist, angle = periodic_pairwise_distance_angle(centers, p)
-
+def evaluate_nearest_neighbor_distance(centers: np.ndarray, radii: np.ndarray, p: RVEParams) -> pd.DataFrame:
+    dist, _ = periodic_pairwise_distance_angle(centers, p)
     sorted_dist = np.sort(dist, axis=1)
-
     r_mean = float(np.mean(radii))
-
-    nn1 = sorted_dist[:, 0] / r_mean
-    nn2 = sorted_dist[:, 1] / r_mean
-    nn3 = sorted_dist[:, 2] / r_mean
-
-    df = pd.DataFrame({
+    return pd.DataFrame({
         "fiber_id": np.arange(1, len(centers) + 1),
-        "nearest_1_h_over_r": nn1,
-        "nearest_2_h_over_r": nn2,
-        "nearest_3_h_over_r": nn3,
+        "nearest_1_h_over_r": sorted_dist[:, 0] / r_mean,
+        "nearest_2_h_over_r": sorted_dist[:, 1] / r_mean,
+        "nearest_3_h_over_r": sorted_dist[:, 2] / r_mean,
     })
 
-    return df
 
-
-def evaluate_nearest_neighbor_orientation(centers, p):
-    """
-    Evaluate nearest-neighbor orientation CDF.
-    For CSR, the theoretical CDF is F(theta) = theta / 360.
-    """
+def evaluate_nearest_neighbor_orientation(centers: np.ndarray, p: RVEParams) -> pd.DataFrame:
     dist, angle = periodic_pairwise_distance_angle(centers, p)
-
     nearest_id = np.argmin(dist, axis=1)
-
-    nn_angle = []
-    for i in range(len(centers)):
-        nn_angle.append(angle[i, nearest_id[i]])
-
-    nn_angle = np.array(nn_angle)
+    nn_angle = np.array([angle[i, nearest_id[i]] for i in range(len(centers))])
     nn_angle_sorted = np.sort(nn_angle)
-
     cdf = np.arange(1, len(nn_angle_sorted) + 1) / float(len(nn_angle_sorted))
     csr_cdf = nn_angle_sorted / 360.0
-
-    df = pd.DataFrame({
+    return pd.DataFrame({
         "orientation_degree": nn_angle_sorted,
         "cdf_algorithm": cdf,
         "cdf_CSR": csr_cdf,
         "cdf_difference": cdf - csr_cdf,
     })
 
-    return df
 
-
-def evaluate_ripley_k(centers, p, h_min_over_r=2.0, h_max_over_r=15.0, n_h=120):
-    """
-    Ripley's K function under periodic boundary condition.
-
-    For CSR:
-        K_CSR(h) = pi * h^2
-
-    Since this RVE is periodic, edge correction is not used here.
-    This is suitable for periodic RVE evaluation.
-    """
+def evaluate_ripley_k(centers: np.ndarray, radii: np.ndarray, p: RVEParams,
+                      h_min_over_r: float = 2.0, h_max_over_r: float = 15.0,
+                      n_h: int = 120) -> pd.DataFrame:
     n = len(centers)
     area = p.Lx_um * p.Ly_um
+    r_mean = float(np.mean(radii))
+    h_min = h_min_over_r * r_mean
+    h_max = min(h_max_over_r * r_mean, 0.5 * min(p.Lx_um, p.Ly_um))
+    h_values = np.linspace(h_min, h_max, n_h)
 
-    # pairwise distance
-    dist, angle = periodic_pairwise_distance_angle(centers, p)
-
-    # use mean radius from average nearest scale
-    # here radius is not passed, so estimate h range with geometry size
-    # h values are passed in absolute scale outside this function.
-    h_values = np.linspace(h_min_over_r, h_max_over_r, n_h)
-
-    # This function receives h already normalized outside?
-    # For clarity, use h_values as absolute h if caller passes absolute.
+    dist, _ = periodic_pairwise_distance_angle(centers, p)
     K_values = []
-
     for h in h_values:
-        count = 0
-
-        for i in range(n):
-            for j in range(n):
-                if i == j:
-                    continue
-                if dist[i, j] <= h:
-                    count += 1
-
-        # ordered pair count. Common periodic estimator: A * count / [N * (N - 1)]
-        K = area * count / float(n * (n - 1))
-        K_values.append(K)
+        count = np.sum(dist <= h)  # ordered pairs; diagonal is inf
+        K_values.append(area * count / float(n * (n - 1)))
 
     K_values = np.array(K_values)
     K_csr = math.pi * h_values ** 2
-
-    df = pd.DataFrame({
+    return pd.DataFrame({
         "h_um": h_values,
+        "h_over_r": h_values / r_mean,
         "K_algorithm": K_values,
         "K_CSR": K_csr,
         "K_minus_KCSR": K_values - K_csr,
     })
 
-    return df
 
-
-def evaluate_pair_distribution_from_k(df_k):
-    """
-    Pair distribution function from Ripley's K:
-
-        g(h) = 1 / (2*pi*h) * dK(h)/dh
-
-    For CSR, g(h) = 1.
-    """
+def evaluate_pair_distribution_from_k(df_k: pd.DataFrame) -> pd.DataFrame:
+    """Paper definition: g(h) = 1/(2*pi*h) * dK/dh."""
     h = df_k["h_um"].values
     K = df_k["K_algorithm"].values
-
     dK_dh = np.gradient(K, h)
-
     g = dK_dh / (2.0 * math.pi * h)
-
-    df = pd.DataFrame({
+    return pd.DataFrame({
         "h_um": h,
+        "h_over_r": df_k["h_over_r"].values,
         "g_algorithm": g,
         "g_CSR": np.ones_like(g),
         "g_minus_1": g - 1.0,
     })
 
-    return df
 
-
-
-
-def evaluate_pair_distribution_shell(centers, radii, p,
-                                     h_min_over_r=None,
-                                     h_max_over_r=None,
-                                     dh_over_r=None,
-                                     smooth_window=None):
-    """
-    Pair distribution function by direct annulus counting.
-
-    This is more stable than differentiating the step-like Ripley's K curve,
-    especially for finite RVEs and high fiber volume fraction.
-
-    For a completely spatially random point process, g(h) = 1.
-    For high-Vf fibers, g(h) usually has a near-contact peak and then
-    oscillates around 1.
-    """
+def evaluate_pair_distribution_shell(centers: np.ndarray, radii: np.ndarray, p: RVEParams) -> pd.DataFrame:
+    """Stable direct annulus-count version; useful for finite-sample plotting."""
     n = len(centers)
     area = p.Lx_um * p.Ly_um
     r_mean = float(np.mean(radii))
-
-    if h_min_over_r is None:
-        h_min_over_r = p.pair_h_min_over_r
-    if h_max_over_r is None:
-        h_max_over_r = p.pair_h_max_over_r
-    if dh_over_r is None:
-        dh_over_r = p.pair_dh_over_r
-    if smooth_window is None:
-        smooth_window = p.pair_smooth_window
-
-    h_min = h_min_over_r * r_mean
-    h_max = h_max_over_r * r_mean
-
-    # With minimum-image periodic distance, the reliable radius should not
-    # exceed half of the smaller side length.
-    h_limit = 0.5 * min(p.Lx_um, p.Ly_um)
-    h_max = min(h_max, h_limit)
-
-    if h_max <= h_min:
-        raise ValueError(
-            "h_max <= h_min. Increase the RVE size or reduce pair_h_max_over_r."
-        )
+    h_min = p.pair_h_min_over_r * r_mean
+    h_max = min(p.pair_h_max_over_r * r_mean, 0.5 * min(p.Lx_um, p.Ly_um))
+    dh = p.pair_dh_over_r * r_mean
 
     dist, _ = periodic_pairwise_distance_angle(centers, p)
-    pair_dist = dist[np.triu_indices(n, k=1)]  # unordered pairs, no double counting
-
-    dh = dh_over_r * r_mean
+    pair_dist = dist[np.triu_indices(n, k=1)]
     edges = np.arange(h_min, h_max + 0.5 * dh, dh)
-    if edges[-1] < h_max:
-        edges = np.append(edges, h_max)
+    if len(edges) < 2:
+        raise ValueError("Pair distribution range too small. Increase RVE size or reduce h range.")
 
     count_unordered, _ = np.histogram(pair_dist, bins=edges)
     h_center = 0.5 * (edges[:-1] + edges[1:])
-
     shell_area = math.pi * (edges[1:] ** 2 - edges[:-1] ** 2)
-
-    # Expected unordered pair number for CSR inside each annulus.
-    # rho=(N-1)/A is used to be consistent with finite-N normalization.
     rho = (n - 1) / area
     expected_unordered = 0.5 * n * rho * shell_area
-
     g_raw = count_unordered / np.maximum(expected_unordered, 1.0e-12)
 
-    if smooth_window is not None and smooth_window > 1:
+    if p.pair_smooth_window is not None and p.pair_smooth_window > 1:
         g = pd.Series(g_raw).rolling(
-            window=int(smooth_window),
+            window=int(p.pair_smooth_window),
             center=True,
-            min_periods=1
+            min_periods=1,
         ).mean().values
     else:
         g = g_raw
 
-    df = pd.DataFrame({
+    return pd.DataFrame({
         "h_um": h_center,
         "h_over_r": h_center / r_mean,
         "count_unordered": count_unordered,
@@ -790,92 +749,159 @@ def evaluate_pair_distribution_shell(centers, radii, p,
         "g_minus_1": g - 1.0,
     })
 
-    return df
 
-
-def contact_peak_diagnostics(centers, radii, p):
-    """
-    Count how many fiber pairs are located very close to h/r≈2.
-    A large value means the first peak of pair distribution will be high.
-    """
+def contact_peak_diagnostics(centers: np.ndarray, radii: np.ndarray, p: RVEParams) -> Dict[str, float]:
     n = len(centers)
     r_mean = float(np.mean(radii))
     dist, _ = periodic_pairwise_distance_angle(centers, p)
     pair_dist = dist[np.triu_indices(n, k=1)]
     h_over_r = pair_dist / r_mean
-
     low = p.contact_low_over_r
     high = p.contact_high_over_r
     count = int(np.sum((h_over_r >= low) & (h_over_r < high)))
     total = int(len(h_over_r))
-    fraction = count / max(total, 1)
-
     return {
         "pair_total": total,
         "min_h_over_r": float(np.min(h_over_r)),
         "contact_interval_low": low,
         "contact_interval_high": high,
         "contact_pair_count": count,
-        "contact_pair_fraction": fraction,
+        "contact_pair_fraction": count / max(total, 1),
     }
 
 
-def layout_randomness_score(centers, radii, p):
+def layout_randomness_score(centers: np.ndarray, radii: np.ndarray, p: RVEParams) -> Tuple[float, Dict[str, float]]:
     """
-    A quick scalar score used to choose among several valid candidates.
+    Scalar score used to choose the best candidate among several valid RVEs.
 
-    The score is intentionally dominated by the direct pair-distribution RMSE
-    because the user's current problem is the excessive first peak of g(h).
+    The score is designed for the user's current purpose:
+    1. keep the pair distribution function close to CSR at medium/large h/r;
+    2. avoid an excessively high first peak near h/r = 2;
+    3. keep the nearest-neighbor orientation reasonably random;
+    4. penalize too many near-contact pairs in the first histogram bin.
+
+    Smaller score means a better candidate.
     """
     df_g = evaluate_pair_distribution_shell(centers, radii, p)
     df_ori = evaluate_nearest_neighbor_orientation(centers, p)
     contact = contact_peak_diagnostics(centers, radii, p)
 
-    g_rmse = math.sqrt(np.mean((df_g["g_algorithm"].values - 1.0) ** 2))
+    g_values = df_g["g_algorithm"].values
+    h_values = df_g["h_over_r"].values
+
+    g_rmse = math.sqrt(np.mean((g_values - 1.0) ** 2))
     orientation_ks = np.max(np.abs(df_ori["cdf_difference"].values))
     contact_fraction = contact["contact_pair_fraction"]
 
-    # Weights are empirical. They favor reducing the excessive near-contact
-    # peak while still keeping orientation reasonably random.
-    score = g_rmse + 0.25 * orientation_ks + 20.0 * contact_fraction
+    # The first bin is the most sensitive part of the pair distribution curve.
+    first_peak = float(g_values[0])
+
+    # Medium/far-field part of g(h). This prevents the candidate selection from
+    # focusing only on the first peak.
+    far_mask = h_values >= 3.0
+    if np.any(far_mask):
+        far_rmse = math.sqrt(np.mean((g_values[far_mask] - 1.0) ** 2))
+    else:
+        far_rmse = g_rmse
+
+    # Empirical weights. The first-peak penalty starts only when the first peak
+    # is obviously high. You can adjust 2.2 if your target curve is different.
+    score = (
+        0.50 * g_rmse
+        + 0.80 * far_rmse
+        + 0.25 * orientation_ks
+        + 0.25 * max(0.0, first_peak - 2.2)
+        + 20.0 * contact_fraction
+    )
 
     return score, {
         "score": score,
         "pair_distribution_RMSE_shell": g_rmse,
+        "pair_distribution_far_RMSE_shell": far_rmse,
         "orientation_CDF_KS_distance": orientation_ks,
         "contact_pair_fraction": contact_fraction,
+        "first_pair_distribution_peak": first_peak,
         "min_h_over_r": contact["min_h_over_r"],
     }
 
-def plot_nearest_neighbor_distance(df_nn, save_path):
+
+# ============================================================
+# Plotting
+# ============================================================
+
+def plot_rve(df_for_abaqus: pd.DataFrame, p: RVEParams, save_path: str):
+    """Plot the main RVE and its periodic copies for checking boundary periodicity."""
+    fig, ax = plt.subplots(figsize=(7, 7))
+    ax.add_patch(Rectangle((0, 0), p.Lx_um, p.Ly_um, fill=False, linewidth=2.0))
+
+    for _, row in df_for_abaqus.iterrows():
+        alpha = 0.35 if bool(row["is_periodic_copy"]) else 0.75
+        ax.add_patch(Circle((row["x_um"], row["y_um"]), row["r_um"], fill=True, alpha=alpha, linewidth=0.6))
+
+    ax.set_aspect("equal")
+    ax.set_xlim(-0.1 * p.Lx_um, 1.1 * p.Lx_um)
+    ax.set_ylim(-0.1 * p.Ly_um, 1.1 * p.Ly_um)
+    ax.set_xlabel("x / μm")
+    ax.set_ylabel("y / μm")
+    ax.set_title("Periodic RVE check, target Vf = %.3f" % p.target_vf)
+    ax.grid(True, linestyle="--", alpha=0.4)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300)
+    plt.show()
+
+
+def plot_rve_main_only(df_for_abaqus: pd.DataFrame, p: RVEParams, save_path: str):
+    """
+    Plot only the main fibers inside the base RVE.
+
+    This figure is cleaner for papers/reports. The periodic-copy figure above is
+    better for checking whether boundary-intersecting fibers have been copied.
+    """
+    fig, ax = plt.subplots(figsize=(7, 7))
+    ax.add_patch(Rectangle((0, 0), p.Lx_um, p.Ly_um, fill=False, linewidth=2.0))
+
+    df_main_only = df_for_abaqus[df_for_abaqus["is_periodic_copy"] == False]
+    for _, row in df_main_only.iterrows():
+        ax.add_patch(Circle((row["x_um"], row["y_um"]), row["r_um"], fill=True, alpha=0.75, linewidth=0.6))
+
+    ax.set_aspect("equal")
+    ax.set_xlim(0.0, p.Lx_um)
+    ax.set_ylim(0.0, p.Ly_um)
+    ax.set_xlabel("x / μm")
+    ax.set_ylabel("y / μm")
+    ax.set_title("Main RVE only, target Vf = %.3f" % p.target_vf)
+    ax.grid(True, linestyle="--", alpha=0.4)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300)
+    plt.show()
+
+
+def plot_failed(centers: np.ndarray, radii: np.ndarray, gap: np.ndarray, p: RVEParams):
+    fig, ax = plt.subplots(figsize=(7, 7))
+    ax.add_patch(Rectangle((0, 0), p.Lx_um, p.Ly_um, fill=False, linewidth=2.0))
+    for c, r in zip(centers, radii):
+        ax.add_patch(Circle((c[0], c[1]), r, fill=True, alpha=0.6))
+    bad = get_bad_pairs(centers, radii, gap, p)
+    for item in bad[:30]:
+        i = item[0] - 1
+        j = item[1] - 1
+        ax.plot([centers[i, 0], centers[j, 0]], [centers[i, 1], centers[j, 1]], linewidth=1.2)
+    ax.set_aspect("equal")
+    ax.set_xlim(-0.1 * p.Lx_um, 1.1 * p.Lx_um)
+    ax.set_ylim(-0.1 * p.Ly_um, 1.1 * p.Ly_um)
+    ax.set_title("Failed layout")
+    ax.grid(True, linestyle="--", alpha=0.4)
+    plt.tight_layout()
+    plt.savefig("failed_layout.png", dpi=300)
+    plt.show()
+
+
+def plot_nearest_neighbor_distance(df_nn: pd.DataFrame, save_path: str):
     plt.figure(figsize=(7, 5))
-
-    bins = 18
-
-    plt.hist(
-        df_nn["nearest_1_h_over_r"].values,
-        bins=bins,
-        density=True,
-        alpha=0.45,
-        label="1st nearest"
-    )
-
-    plt.hist(
-        df_nn["nearest_2_h_over_r"].values,
-        bins=bins,
-        density=True,
-        alpha=0.45,
-        label="2nd nearest"
-    )
-
-    plt.hist(
-        df_nn["nearest_3_h_over_r"].values,
-        bins=bins,
-        density=True,
-        alpha=0.45,
-        label="3rd nearest"
-    )
-
+    bins = 22
+    plt.hist(df_nn["nearest_1_h_over_r"].values, bins=bins, density=True, alpha=0.45, label="1st nearest")
+    plt.hist(df_nn["nearest_2_h_over_r"].values, bins=bins, density=True, alpha=0.45, label="2nd nearest")
+    plt.hist(df_nn["nearest_3_h_over_r"].values, bins=bins, density=True, alpha=0.45, label="3rd nearest")
     plt.xlabel("h / r")
     plt.ylabel("PDF")
     plt.title("Nearest-neighbor distance distribution")
@@ -886,24 +912,10 @@ def plot_nearest_neighbor_distance(df_nn, save_path):
     plt.show()
 
 
-def plot_nearest_neighbor_orientation(df_ori, save_path):
+def plot_nearest_neighbor_orientation(df_ori: pd.DataFrame, save_path: str):
     plt.figure(figsize=(7, 5))
-
-    plt.plot(
-        df_ori["orientation_degree"].values,
-        df_ori["cdf_algorithm"].values,
-        linewidth=2.0,
-        label="Generated RVE"
-    )
-
-    plt.plot(
-        df_ori["orientation_degree"].values,
-        df_ori["cdf_CSR"].values,
-        linestyle="--",
-        linewidth=2.0,
-        label="CSR"
-    )
-
+    plt.plot(df_ori["orientation_degree"].values, df_ori["cdf_algorithm"].values, linewidth=2.0, label="Generated RVE")
+    plt.plot(df_ori["orientation_degree"].values, df_ori["cdf_CSR"].values, linestyle="--", linewidth=2.0, label="CSR")
     plt.xlabel("Orientation / degree")
     plt.ylabel("CDF")
     plt.title("Nearest-neighbor orientation CDF")
@@ -916,26 +928,10 @@ def plot_nearest_neighbor_orientation(df_ori, save_path):
     plt.show()
 
 
-def plot_ripley_k(df_k, radii, save_path):
-    r_mean = float(np.mean(radii))
-
+def plot_ripley_k(df_k: pd.DataFrame, save_path: str):
     plt.figure(figsize=(7, 5))
-
-    plt.plot(
-        df_k["h_um"].values / r_mean,
-        df_k["K_algorithm"].values,
-        linewidth=2.0,
-        label="Generated RVE"
-    )
-
-    plt.plot(
-        df_k["h_um"].values / r_mean,
-        df_k["K_CSR"].values,
-        linestyle="--",
-        linewidth=2.0,
-        label="CSR"
-    )
-
+    plt.plot(df_k["h_over_r"].values, df_k["K_algorithm"].values, linewidth=2.0, label="Generated RVE")
+    plt.plot(df_k["h_over_r"].values, df_k["K_CSR"].values, linestyle="--", linewidth=2.0, label="CSR")
     plt.xlabel("h / r")
     plt.ylabel("K(h)")
     plt.title("Ripley's K function")
@@ -946,40 +942,16 @@ def plot_ripley_k(df_k, radii, save_path):
     plt.show()
 
 
-def plot_pair_distribution(df_g, radii, save_path):
-    r_mean = float(np.mean(radii))
-
-    if "h_over_r" in df_g.columns:
-        x = df_g["h_over_r"].values
-    else:
-        x = df_g["h_um"].values / r_mean
-
+def plot_pair_distribution(df_g: pd.DataFrame, save_path: str):
     plt.figure(figsize=(7, 5))
-
-    plt.plot(
-        x,
-        df_g["g_algorithm"].values,
-        linewidth=2.0,
-        label="Generated RVE"
-    )
-
-    plt.plot(
-        x,
-        df_g["g_CSR"].values,
-        linestyle="--",
-        linewidth=2.0,
-        label="CSR"
-    )
-
+    plt.plot(df_g["h_over_r"].values, df_g["g_algorithm"].values, linewidth=2.0, label="Generated RVE")
+    plt.plot(df_g["h_over_r"].values, df_g["g_CSR"].values, linestyle="--", linewidth=2.0, label="CSR")
     plt.xlabel("h / r")
     plt.ylabel("g(h)")
     plt.title("Pair distribution function")
-    plt.xlim(float(np.min(x)), float(np.max(x)))
-
-    # Keep the plot readable. The raw values are still saved in Excel.
+    plt.xlim(float(np.min(df_g["h_over_r"].values)), float(np.max(df_g["h_over_r"].values)))
     ymax = max(3.0, min(8.0, 1.15 * float(np.nanmax(df_g["g_algorithm"].values))))
     plt.ylim(0.0, ymax)
-
     plt.legend()
     plt.grid(True, linestyle="--", alpha=0.4)
     plt.tight_layout()
@@ -987,141 +959,86 @@ def plot_pair_distribution(df_g, radii, save_path):
     plt.show()
 
 
-def evaluate_randomness(centers, radii, p, output_prefix="fiber_centers"):
-    """
-    Run all randomness evaluations similar to the paper:
-    1. nearest neighbor distance
-    2. nearest neighbor orientation
-    3. Ripley's K function
-    4. pair distribution function
-    """
+# ============================================================
+# Evaluation and main generation
+# ============================================================
+
+def evaluate_randomness(centers: np.ndarray, radii: np.ndarray, p: RVEParams, output_prefix: str):
     print("\n" + "=" * 80)
     print("Randomness evaluation starts...")
     print("=" * 80)
 
-    r_mean = float(np.mean(radii))
-
-    # 1. nearest neighbor distance
     df_nn = evaluate_nearest_neighbor_distance(centers, radii, p)
-
-    # 2. nearest neighbor orientation
     df_ori = evaluate_nearest_neighbor_orientation(centers, p)
+    df_k = evaluate_ripley_k(centers, radii, p)
 
-    # 3. Ripley's K
-    h_min = 2.0 * r_mean
-    h_max = min(15.0 * r_mean, 0.5 * min(p.Lx_um, p.Ly_um))
-    df_k = evaluate_ripley_k(
-        centers,
-        p,
-        h_min_over_r=h_min,
-        h_max_over_r=h_max,
-        n_h=120
-    )
+    # The paper defines g(h) from dK/dh; direct-shell version is also saved.
+    df_g_from_k = evaluate_pair_distribution_from_k(df_k)
+    df_g_shell = evaluate_pair_distribution_shell(centers, radii, p)
 
-    # 4. pair distribution function
-    # Direct annulus counting is used because differentiating K(h) strongly
-    # amplifies finite-sample jumps near h/r≈2.
-    df_g = evaluate_pair_distribution_shell(centers, radii, p)
     contact_diag = contact_peak_diagnostics(centers, radii, p)
-
-    # Summary indices
     orientation_ks = np.max(np.abs(df_ori["cdf_difference"].values))
-
-    k_rmse = math.sqrt(
-        np.mean(
-            (
-                (df_k["K_algorithm"].values - df_k["K_CSR"].values)
-                / np.maximum(df_k["K_CSR"].values, 1.0e-12)
-            ) ** 2
-        )
-    )
-
-    g_rmse = math.sqrt(
-        np.mean(
-            (df_g["g_algorithm"].values - 1.0) ** 2
-        )
-    )
+    k_rmse = math.sqrt(np.mean(((df_k["K_algorithm"].values - df_k["K_CSR"].values) / np.maximum(df_k["K_CSR"].values, 1.0e-12)) ** 2))
+    g_rmse_shell = math.sqrt(np.mean((df_g_shell["g_algorithm"].values - 1.0) ** 2))
+    g_rmse_from_k = math.sqrt(np.mean((df_g_from_k["g_algorithm"].values - 1.0) ** 2))
 
     summary = pd.DataFrame([{
         "fiber_number": len(centers),
-        "mean_radius_um": r_mean,
+        "mean_radius_um": float(np.mean(radii)),
         "nearest_1_mean_h_over_r": df_nn["nearest_1_h_over_r"].mean(),
         "nearest_1_std_h_over_r": df_nn["nearest_1_h_over_r"].std(),
         "nearest_2_mean_h_over_r": df_nn["nearest_2_h_over_r"].mean(),
         "nearest_3_mean_h_over_r": df_nn["nearest_3_h_over_r"].mean(),
         "orientation_CDF_KS_distance": orientation_ks,
         "Ripley_K_relative_RMSE": k_rmse,
-        "pair_distribution_RMSE": g_rmse,
+        "pair_distribution_RMSE_from_K_paper_definition": g_rmse_from_k,
+        "pair_distribution_RMSE_shell_stable": g_rmse_shell,
         "contact_pair_fraction": contact_diag["contact_pair_fraction"],
         "contact_pair_count": contact_diag["contact_pair_count"],
         "min_h_over_r": contact_diag["min_h_over_r"],
     }])
 
-    # Save figures
-    plot_nearest_neighbor_distance(
-        df_nn,
-        save_path=output_prefix + "_eval_nearest_distance.png"
-    )
+    plot_nearest_neighbor_distance(df_nn, output_prefix + "_eval_nearest_distance.png")
+    plot_nearest_neighbor_orientation(df_ori, output_prefix + "_eval_orientation_cdf.png")
+    plot_ripley_k(df_k, output_prefix + "_eval_ripley_k.png")
+    plot_pair_distribution(df_g_shell, output_prefix + "_eval_pair_distribution_shell.png")
+    plot_pair_distribution(df_g_from_k, output_prefix + "_eval_pair_distribution_from_K.png")
 
-    plot_nearest_neighbor_orientation(
-        df_ori,
-        save_path=output_prefix + "_eval_orientation_cdf.png"
-    )
-
-    plot_ripley_k(
-        df_k,
-        radii,
-        save_path=output_prefix + "_eval_ripley_k.png"
-    )
-
-    plot_pair_distribution(
-        df_g,
-        radii,
-        save_path=output_prefix + "_eval_pair_distribution.png"
-    )
-
-    # Save Excel
     eval_xlsx = output_prefix + "_randomness_evaluation.xlsx"
-
     with pd.ExcelWriter(eval_xlsx, engine="openpyxl") as writer:
         summary.to_excel(writer, sheet_name="summary", index=False)
         df_nn.to_excel(writer, sheet_name="nearest_distance", index=False)
         df_ori.to_excel(writer, sheet_name="orientation_cdf", index=False)
         df_k.to_excel(writer, sheet_name="ripley_k", index=False)
-        df_g.to_excel(writer, sheet_name="pair_distribution", index=False)
+        df_g_from_k.to_excel(writer, sheet_name="pair_distribution_from_K", index=False)
+        df_g_shell.to_excel(writer, sheet_name="pair_distribution_shell", index=False)
 
     print("Randomness evaluation finished.")
-    print("Evaluation file saved:")
-    print(eval_xlsx)
+    print("Evaluation file saved:", eval_xlsx)
+    print("orientation CDF KS distance       = %.6e" % orientation_ks)
+    print("Ripley K relative RMSE            = %.6e" % k_rmse)
+    print("Pair distribution RMSE from K     = %.6e" % g_rmse_from_k)
+    print("Pair distribution RMSE shell      = %.6e" % g_rmse_shell)
+    print("contact pair fraction             = %.6e" % contact_diag["contact_pair_fraction"])
+    print("min h/r                           = %.6e" % contact_diag["min_h_over_r"])
     print("=" * 80)
 
-    print("Key evaluation indices:")
-    print("orientation CDF KS distance = %.6e" % orientation_ks)
-    print("Ripley K relative RMSE      = %.6e" % k_rmse)
-    print("pair distribution RMSE      = %.6e" % g_rmse)
-    print("contact pair fraction       = %.6e" % contact_diag["contact_pair_fraction"])
-    print("min h/r                     = %.6e" % contact_diag["min_h_over_r"])
-    print("=" * 80)
+    return summary, df_nn, df_ori, df_k, df_g_shell
 
-    return summary, df_nn, df_ori, df_k, df_g
 
-# ============================================================
-# Main
-# ============================================================
+def generate_one_candidate(p: RVEParams, radii: np.ndarray, gap: np.ndarray,
+                           rng: np.random.Generator) -> Tuple[np.ndarray, Dict[str, float]]:
+    centers = random_initial_centers(p, len(radii), rng)
+    centers = paper_step1_initial_optimization(centers, radii, gap, p, rng)
+    centers = paper_step2_reorientation(centers, radii, gap, p, rng)
+    centers = monte_carlo_shuffle(centers, radii, gap, p, rng)
+    metrics = compute_metrics(centers, radii, gap, p)
+    return centers, metrics
 
-def generate(p):
-    # ------------------------------------------------------------
-    # Random seed control
-    # ------------------------------------------------------------
-    # If p.seed is None, a new seed is generated from the current time.
-    # Therefore, every run will generate a different RVE.
-    # If p.seed is an integer, the result is fully reproducible.
+
+def generate(p: RVEParams):
     if p.seed is None:
-        p.seed = int(time.time() * 1000000) % (2**32)
-
-    print("=" * 80)
-    print("Random seed used in this run: %d" % p.seed)
-    print("=" * 80)
+        p.seed = int(time.time() * 1000000) % (2 ** 32)
 
     random.seed(p.seed)
     rng = np.random.default_rng(p.seed)
@@ -1131,13 +1048,15 @@ def generate(p):
     vf = actual_vf(radii, p)
 
     print("=" * 80)
-    print("Random periodic RVE generation")
-    print("Lx, Ly         = %.6f, %.6f um" % (p.Lx_um, p.Ly_um))
-    print("target Vf      = %.6f" % p.target_vf)
-    print("actual Vf      = %.6f" % vf)
-    print("fiber number   = %d" % n)
-    print("diameter mode  = %s" % p.diameter_mode)
-    print("lmin, lmax     = %.6f, %.6f um" % (p.lmin_um, p.lmax_um))
+    print("Paper-like random periodic RVE generation")
+    print("Random seed used = %d" % p.seed)
+    print("Lx, Ly           = %.6f, %.6f um" % (p.Lx_um, p.Ly_um))
+    print("target Vf        = %.6f" % p.target_vf)
+    print("actual Vf        = %.6f" % vf)
+    print("fiber number     = %d" % n)
+    print("diameter mode    = %s" % p.diameter_mode)
+    print("lmin, lmax       = %.6f, %.6f um" % (p.lmin_um, p.lmax_um))
+    print("periodic metric  = %s" % str(p.use_periodic_distance))
     print("=" * 80)
 
     best_centers = None
@@ -1145,106 +1064,52 @@ def generate(p):
     best_metrics = None
     best_score = None
     best_score_info = None
-
-    # Backup for reporting if no valid layout is found.
-    best_invalid_centers = None
-    best_invalid_gap = None
-    best_invalid_metrics = None
-
+    best_invalid = None
     valid_found = 0
 
     for restart in range(1, p.max_restarts + 1):
         print("\nrestart %03d starts..." % restart, flush=True)
-
         gap = make_gap_matrix(p, n, rng)
-        centers = random_initial_centers(p, n, rng)
-
-        centers = growth_relax(centers, radii, gap, p, rng)
-        metrics = compute_metrics(centers, radii, gap, p)
+        centers, metrics = generate_one_candidate(p, radii, gap, rng)
 
         print(
-            "restart %03d | min_gap = %.6e | min_margin = %.6e | "
-            "max_overlap = %.6e | max_violation = %.6e | energy = %.6e"
-            % (
-                restart,
-                metrics["min_surface_gap"],
-                metrics["min_constraint_margin"],
-                metrics["max_overlap"],
-                metrics["max_violation"],
-                metrics["energy"],
-            )
+            "restart %03d | min_gap = %.6e | min_margin = %.6e | max_overlap = %.6e | max_violation = %.6e | energy = %.6e"
+            % (restart, metrics["min_surface_gap"], metrics["min_constraint_margin"],
+               metrics["max_overlap"], metrics["max_violation"], metrics["energy"])
         )
 
-        # Track the best invalid result only for debugging/failure report.
-        if best_invalid_metrics is None or metrics["energy"] < best_invalid_metrics["energy"]:
-            best_invalid_centers = centers.copy()
-            best_invalid_gap = gap.copy()
-            best_invalid_metrics = metrics.copy()
+        if best_invalid is None or metrics["energy"] < best_invalid[2]["energy"]:
+            best_invalid = (centers.copy(), gap.copy(), metrics.copy())
 
-        is_valid = (
-            metrics["max_overlap"] <= p.tol_um and
-            metrics["max_violation"] <= p.tol_um
-        )
-
+        is_valid = metrics["max_overlap"] <= p.tol_um and metrics["max_violation"] <= p.tol_um
         if not is_valid:
             continue
 
         valid_found += 1
         print("Valid candidate %d found." % valid_found)
 
-        candidate_centers = centers.copy()
-
-        if p.use_mc_shuffle:
-            candidate_centers = monte_carlo_shuffle(
-                candidate_centers,
-                radii,
-                gap,
-                p,
-                rng,
-                steps_per_fiber=p.mc_steps_per_fiber,
-                move_amp_um=p.mc_move_amp_um
-            )
-
-        candidate_metrics = compute_metrics(candidate_centers, radii, gap, p)
-
-        # Safety check after Monte-Carlo shuffle.
-        if (
-            candidate_metrics["max_overlap"] > p.tol_um or
-            candidate_metrics["max_violation"] > p.tol_um
-        ):
-            print("Warning: candidate became invalid after MC shuffle. It is skipped.")
-            continue
-
         if p.selection_mode == "first_valid":
-            best_centers = candidate_centers.copy()
+            best_centers = centers.copy()
             best_gap = gap.copy()
-            best_metrics = candidate_metrics.copy()
+            best_metrics = metrics.copy()
             best_score = 0.0
             best_score_info = {"score": 0.0}
-            print("\nAccepted first valid layout.")
+            print("Accepted first valid layout.")
             break
 
-        candidate_score, candidate_score_info = layout_randomness_score(
-            candidate_centers,
-            radii,
-            p
-        )
-
+        candidate_score, candidate_score_info = layout_randomness_score(centers, radii, p)
         print(
-            "candidate randomness score = %.6e | g_RMSE = %.6e | "
-            "contact_fraction = %.6e | min_h/r = %.6f"
-            % (
-                candidate_score_info["score"],
-                candidate_score_info["pair_distribution_RMSE_shell"],
-                candidate_score_info["contact_pair_fraction"],
-                candidate_score_info["min_h_over_r"],
-            )
+            "candidate randomness score = %.6e | g_RMSE(shell) = %.6e | contact_fraction = %.6e | min_h/r = %.6f"
+            % (candidate_score_info["score"],
+               candidate_score_info["pair_distribution_RMSE_shell"],
+               candidate_score_info["contact_pair_fraction"],
+               candidate_score_info["min_h_over_r"])
         )
 
         if best_score is None or candidate_score < best_score:
-            best_centers = candidate_centers.copy()
+            best_centers = centers.copy()
             best_gap = gap.copy()
-            best_metrics = candidate_metrics.copy()
+            best_metrics = metrics.copy()
             best_score = candidate_score
             best_score_info = candidate_score_info.copy()
             print("This candidate is currently the best valid layout.")
@@ -1253,12 +1118,9 @@ def generate(p):
             print("\nRequired number of valid candidates reached.")
             break
 
-    # If no valid candidate survived the selection procedure, use the best
-    # invalid result for failure reporting.
-    if best_metrics is None:
-        best_centers = best_invalid_centers
-        best_gap = best_invalid_gap
-        best_metrics = best_invalid_metrics
+    if best_centers is None:
+        print("\nNo valid candidate found. Reporting best invalid candidate.")
+        best_centers, best_gap, best_metrics = best_invalid
 
     if best_score_info is not None:
         print("\nBest valid candidate score information:")
@@ -1270,19 +1132,12 @@ def generate(p):
 
     if best_metrics["max_overlap"] > p.tol_um or best_metrics["max_violation"] > p.tol_um:
         print("\nGeneration failed.")
-        print("Best metrics:")
-        print(best_metrics)
-
+        print("Best metrics:", best_metrics)
         bad = get_bad_pairs(best_centers, radii, best_gap, p)
         print("Bad pair number:", len(bad))
         for item in bad[:20]:
-            print(
-                "fiber %d - %d | d = %.6f | required = %.6f | violation = %.6e"
-                % item
-            )
-
+            print("fiber %d - %d | d = %.6f | required = %.6f | violation = %.6e" % item)
         plot_failed(best_centers, radii, best_gap, p)
-
         raise RuntimeError("生成失败：仍然存在相交或间距不足，不要导入 Abaqus。")
 
     df_main = build_main_dataframe(best_centers, radii)
@@ -1298,14 +1153,17 @@ def generate(p):
         "diameter_mode": p.diameter_mode,
         "diameter_mean_um": p.diameter_mean_um,
         "diameter_std_um": p.diameter_std_um,
+        "diameter_min_um": p.diameter_min_um,
+        "diameter_max_um": p.diameter_max_um,
         "lmin_um": p.lmin_um,
         "lmax_um": p.lmax_um,
-        "selection_mode": p.selection_mode,
         "valid_candidates_found": valid_found,
-        "use_mc_shuffle": p.use_mc_shuffle,
-        "mc_steps_per_fiber": p.mc_steps_per_fiber,
-        "mc_move_amp_um": p.mc_move_amp_um,
+        "selection_mode": p.selection_mode,
         "best_randomness_score": best_score,
+        "use_reorientation": p.use_reorientation,
+        "reorient_passes": p.reorient_passes,
+        "reorient_trials_per_fiber": p.reorient_trials_per_fiber,
+        "use_periodic_distance": p.use_periodic_distance,
         "min_surface_gap_um": best_metrics["min_surface_gap"],
         "min_constraint_margin_um": best_metrics["min_constraint_margin"],
         "max_overlap_um": best_metrics["max_overlap"],
@@ -1315,6 +1173,7 @@ def generate(p):
     main_csv = p.output_prefix + "_main.csv"
     abaqus_csv = p.output_prefix + "_for_abaqus.csv"
     xlsx_file = p.output_prefix + ".xlsx"
+    preview_png = p.output_prefix + "_preview.png"
 
     df_main.to_csv(main_csv, index=False, encoding="utf-8-sig")
     df_for_abaqus.to_csv(abaqus_csv, index=False, encoding="utf-8-sig")
@@ -1324,15 +1183,19 @@ def generate(p):
         df_for_abaqus.to_excel(writer, sheet_name="for_abaqus", index=False)
         summary.to_excel(writer, sheet_name="summary", index=False)
 
-    plot_rve(df_for_abaqus, p)
+    plot_rve(df_for_abaqus, p, preview_png)
+    plot_rve_main_only(df_for_abaqus, p, p.output_prefix + "_main_only_preview.png")
     evaluate_randomness(best_centers, radii, p, output_prefix=p.output_prefix)
+
     print("\n" + "=" * 80)
     print("Generation succeeded.")
     print("Saved files:")
     print(main_csv)
     print(abaqus_csv)
     print(xlsx_file)
-    print("rve_preview.png")
+    print(preview_png)
+    print(p.output_prefix + "_main_only_preview.png")
+    print(p.output_prefix + "_randomness_evaluation.xlsx")
     print("=" * 80)
     print("actual Vf       = %.8f" % vf)
     print("min gap         = %.8e um" % best_metrics["min_surface_gap"])
@@ -1342,59 +1205,247 @@ def generate(p):
     print("=" * 80)
 
 
-if __name__ == "__main__":
+# ============================================================
+# Parameter presets
+# ============================================================
 
-    params = RVEParams(
-        # 100 x 100 um gives much more stable statistics than 50 x 50 um.
-        # If you need the full h/r = 15 range strictly, 120 x 120 um is better.
+def make_fast_test_params() -> RVEParams:
+    """Practical preset: faster than the full paper statistical size."""
+    return RVEParams(
         Lx_um=100.0,
         Ly_um=100.0,
+        target_vf=0.70,
+        diameter_mode="constant",
+        diameter_mean_um=7.0,
+        diameter_std_um=0.317,
+        lmin_um=0.175,
+        lmax_um=0.350,
+        max_restarts=80,
+        valid_candidates_to_test=3,
+        selection_mode="best_valid_randomness",
+        opt_alpha_steps=35,
+        opt_iter_per_alpha=600,
+        opt_final_iter=4000,
+        use_reorientation=True,
+        reorient_passes=2,
+        reorient_trials_per_fiber=60,
+        use_mc_shuffle=True,
+        mc_steps_per_fiber=150,
+        mc_move_amp_um=0.03,
+        pair_smooth_window=1,
+        contact_low_over_r=2.0,
+        contact_high_over_r=2.35,
+        seed=2026,
+        output_prefix="fiber_centers_paper_like_100um_vf70",
+    )
 
+
+def make_paper_fig10_vf70_params() -> RVEParams:
+    """
+    Vf=70% preset close to the paper's statistical verification setting.
+
+    The paper uses delta = L/r = 50. With r = 3.5 um, L = 175 um.
+    For Vf=70%, use lmin = 0.175 um and lmax = 0.350 um.
+
+    This preset is configured for practical periodic-RVE generation using the
+    relaxation method and the minimum-image distance criterion. It is suitable
+    for later Abaqus PBC use.
+    """
+    return RVEParams(
+        Lx_um=175.0,
+        Ly_um=175.0,
         target_vf=0.70,
 
-        # Using a normal diameter distribution usually reduces the artificial
-        # near-contact peak compared with perfectly identical fibers.
-        diameter_mode="normal",
+        diameter_mode="constant",
         diameter_mean_um=7.0,
         diameter_std_um=0.317,
 
-        # If you must use the exact narrow paper setting, change this back to
-        # 0.10-0.15. A wider gap interval helps avoid all near contacts being
-        # concentrated at the same h/r value.
-        lmin_um=0.1,
-        lmax_um=0.15,
+        lmin_um=0.175,
+        lmax_um=0.350,
 
-        max_restarts=200,
-
-        growth_steps=45,
-        relax_iter_per_step=1200,
-        final_relax_iter=20000,
-
-        # Random shaking during growth. Larger values keep more randomness
-        # but may make convergence harder.
-        random_shake_um=0.08,
-
-        tol_um=1.0e-7,
-
+        max_restarts=160,
+        valid_candidates_to_test=8,
         selection_mode="best_valid_randomness",
-        valid_candidates_to_test=5,
+
+        opt_alpha_steps=40,
+        opt_iter_per_alpha=800,
+        opt_final_iter=6000,
+
+        use_reorientation=True,
+        reorient_passes=2,
+        reorient_trials_per_fiber=60,
 
         use_mc_shuffle=True,
-        mc_steps_per_fiber=800,
-        mc_move_amp_um=0.06,
+        mc_steps_per_fiber=200,
+        mc_move_amp_um=0.03,
 
-        pair_h_min_over_r=2.0,
-        pair_h_max_over_r=15.0,
-        pair_dh_over_r=0.35,
-        pair_smooth_window=5,
+        use_periodic_distance=True,
 
+        pair_smooth_window=1,
         contact_low_over_r=2.0,
-        contact_high_over_r=2.10,
+        contact_high_over_r=2.35,
 
-        # seed=None: every run generates a different RVE.
-        # seed=2026: every run reproduces the same RVE.
         seed=2026,
-        output_prefix="fiber_centers_100um_randomness_selected"
+        output_prefix="fiber_centers_periodic_relaxation_vf70_optimized",
     )
 
+
+def make_real_diameter_vf60_params() -> RVEParams:
+    """
+    Preset for the paper's T700/7901 validation idea: measured fiber diameter
+    is close to a normal distribution with mean around 6.92 um and std 0.317 um.
+    """
+    return RVEParams(
+        Lx_um=50.0,
+        Ly_um=50.0,
+        target_vf=0.60,
+        diameter_mode="normal",
+        diameter_mean_um=6.92,
+        diameter_std_um=0.317,
+        lmin_um=0.175,
+        lmax_um=0.875,
+        max_restarts=100,
+        valid_candidates_to_test=5,
+        selection_mode="best_valid_randomness",
+        opt_alpha_steps=35,
+        opt_iter_per_alpha=600,
+        opt_final_iter=4000,
+        use_reorientation=True,
+        reorient_passes=3,
+        reorient_trials_per_fiber=80,
+        use_mc_shuffle=False,
+        pair_smooth_window=1,
+        seed=2026,
+        output_prefix="fiber_centers_real_diameter_vf60",
+    )
+
+
+def build_user_params() -> RVEParams:
+    """
+    ========================== USER OPERATION CENTER ==========================
+    All frequently adjusted parameters are collected here.
+
+    Recommended workflow:
+    1. First use PRESET = "fast_100um_vf70" to check whether the code runs.
+    2. Then use PRESET = "paper_vf70_periodic" for the formal Vf=70% model.
+    3. Change only the values in this function for most daily operations.
+    ==========================================================================
+    """
+
+    # ----------------------------------------------------------------------
+    # 1. Choose a preset
+    # ----------------------------------------------------------------------
+    # "fast_100um_vf70"     : faster test model, L=100 um, Vf=70%.
+    # "paper_vf70_periodic" : formal periodic model, L=175 um, Vf=70%.
+    # "real_diameter_vf60"  : normal fiber diameter distribution, Vf=60%.
+    PRESET = "paper_vf70_periodic"
+
+    if PRESET == "fast_100um_vf70":
+        params = make_fast_test_params()
+    elif PRESET == "paper_vf70_periodic":
+        params = make_paper_fig10_vf70_params()
+    elif PRESET == "real_diameter_vf60":
+        params = make_real_diameter_vf60_params()
+    else:
+        raise ValueError("Unknown PRESET. Check build_user_params().")
+
+    # ----------------------------------------------------------------------
+    # 2. Geometry and volume fraction
+    # ----------------------------------------------------------------------
+    # For the paper Vf=70% statistical setting, use Lx=Ly=175 um, d=7 um.
+    # If you change Lx/Ly/target_vf/diameter, the fiber number is recalculated.
+    params.Lx_um = params.Lx_um
+    params.Ly_um = params.Ly_um
+    params.target_vf = params.target_vf
+
+    # ----------------------------------------------------------------------
+    # 3. Fiber diameter mode
+    # ----------------------------------------------------------------------
+    # Options: "constant", "normal", "uniform".
+    params.diameter_mode = params.diameter_mode
+    params.diameter_mean_um = params.diameter_mean_um
+    params.diameter_std_um = params.diameter_std_um
+    params.diameter_min_um = params.diameter_min_um
+    params.diameter_max_um = params.diameter_max_um
+
+    # ----------------------------------------------------------------------
+    # 4. Inter-fiber random spacing
+    # ----------------------------------------------------------------------
+    # Paper examples:
+    #   Vf = 60%, 65%: lmin=0.175 um, lmax=0.875 um
+    #   Vf = 70%     : lmin=0.175 um, lmax=0.350 um
+    #   Vf = 80%     : lmin=0.100 um, lmax=0.150 um
+    params.lmin_um = params.lmin_um
+    params.lmax_um = params.lmax_um
+
+    # ----------------------------------------------------------------------
+    # 5. Periodic geometry switch for Abaqus PBC
+    # ----------------------------------------------------------------------
+    # True  : use minimum-image distance. Recommended for PBC geometry.
+    # False : ordinary non-periodic distance. Usually not recommended for PBC.
+    params.use_periodic_distance = True
+
+    # ----------------------------------------------------------------------
+    # 6. Candidate search and randomness selection
+    # ----------------------------------------------------------------------
+    # Larger valid_candidates_to_test gives a better chance of finding a curve
+    # with a reasonable pair-distribution first peak, but costs more time.
+    params.valid_candidates_to_test = params.valid_candidates_to_test
+    params.max_restarts = params.max_restarts
+    params.selection_mode = "best_valid_randomness"
+
+    # ----------------------------------------------------------------------
+    # 7. Relaxation parameters
+    # ----------------------------------------------------------------------
+    # Usually do not need to change these. If generation fails, increase
+    # opt_iter_per_alpha or opt_final_iter.
+    params.opt_alpha_steps = params.opt_alpha_steps
+    params.opt_iter_per_alpha = params.opt_iter_per_alpha
+    params.opt_final_iter = params.opt_final_iter
+
+    # ----------------------------------------------------------------------
+    # 8. Re-orientation parameters
+    # ----------------------------------------------------------------------
+    # Too strong re-orientation may make the layout overly regular.
+    # A practical setting is passes=2, trials=60, then use a small MC shuffle.
+    params.use_reorientation = True
+    params.reorient_passes = params.reorient_passes
+    params.reorient_trials_per_fiber = params.reorient_trials_per_fiber
+
+    # ----------------------------------------------------------------------
+    # 9. Optional legal Monte Carlo shuffle
+    # ----------------------------------------------------------------------
+    # This does not break spacing constraints. It helps reduce artificial
+    # near-contact pile-up from the relaxation step.
+    params.use_mc_shuffle = params.use_mc_shuffle
+    params.mc_steps_per_fiber = params.mc_steps_per_fiber
+    params.mc_move_amp_um = params.mc_move_amp_um
+
+    # ----------------------------------------------------------------------
+    # 10. Pair distribution settings
+    # ----------------------------------------------------------------------
+    # First bin = [pair_h_min_over_r, pair_h_min_over_r + pair_dh_over_r].
+    # Therefore, if pair_h_min_over_r=2.0 and pair_dh_over_r=0.35, set
+    # contact_high_over_r=2.35 for candidate scoring.
+    params.pair_h_min_over_r = 2.0
+    params.pair_h_max_over_r = 15.0
+    params.pair_dh_over_r = 0.35
+    params.contact_low_over_r = 2.0
+    params.contact_high_over_r = 2.35
+
+    # 1 = raw curve. Use 3 or 5 only for smoother visual display.
+    params.pair_smooth_window = 1
+
+    # ----------------------------------------------------------------------
+    # 11. Random seed and output name
+    # ----------------------------------------------------------------------
+    # seed=None gives a new RVE every run. seed=2026 reproduces the same RVE.
+    params.seed = 2026
+    params.output_prefix = "fiber_centers_periodic_relaxation_vf70_optimized"
+
+    return params
+
+
+if __name__ == "__main__":
+    params = build_user_params()
     generate(params)
