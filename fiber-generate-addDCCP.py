@@ -8,8 +8,12 @@ STEP 1. Establish a packing-optimization model and obtain initial fiber coordina
         The paper solves the non-objective constrained model with DCCP:
             (xi-xj)^2 + (yi-yj)^2 >= (ri+rj+dis[i,j])^2
             dis[i,j] = random.uniform(lmin, lmax)
-        In this standalone script, the same constraints are imposed by a
-        penalty/relaxation optimizer. It is faster and more practical than the DCCP method for large periodic RVEs.
+        In this standalone script, two STEP-1 solvers are available:
+        (1) periodic penalty/relaxation, which is fast and suitable for large PBC RVEs;
+        (2) non-periodic DCCP packing, which is closer to the paper formulation but is
+            used without expensive 3x3 periodic-image constraints.
+        A hybrid mode can use DCCP first and then apply a short periodic relaxation
+        polish so that the final geometry is compatible with PBC.
 
 STEP 2. Re-orientation method.
         Fibers are repeatedly tested for relocation into resin-rich positions.
@@ -73,6 +77,39 @@ class RVEParams:
     max_restarts: int = 200
     valid_candidates_to_test: int = 5
     selection_mode: str = "best_valid_randomness"  # first_valid or best_valid_randomness
+
+    # STEP 1 solver method
+    #   "relaxation"  : fast periodic minimum-image relaxation. Best for large PBC RVEs.
+    #   "dccp"        : non-periodic DCCP packing, followed by optional periodic polish.
+    #   "hybrid_dccp" : try DCCP; if DCCP fails, fall back to relaxation result.
+    # Important: this DCCP mode does NOT impose strict 3x3 periodic-image constraints,
+    # because that version is too expensive for large Vf=70% RVEs.
+    step1_method: str = "relaxation"
+
+    # DCCP settings for non-periodic packing
+    # boundary_mode="cell"  : centers are constrained by 0<=x<=Lx, 0<=y<=Ly.
+    #                         This allows boundary-intersecting fibers after periodic copy.
+    # boundary_mode="inside": centers are constrained by r<=x<=Lx-r, r<=y<=Ly-r.
+    #                         This is closer to paper Eq.(2), but less useful for PBC.
+    dccp_boundary_mode: str = "cell"
+    dccp_use_relaxation_warm_start: bool = True
+    dccp_regularization: float = 1.0e-6
+    dccp_solver: str = "SCS"
+    dccp_ccp_times: int = 1
+    dccp_max_iter: int = 60
+    dccp_tau: float = 0.005
+    dccp_mu: float = 1.2
+    dccp_tau_max: float = 1.0e8
+    dccp_solver_eps: float = 1.0e-4
+    dccp_solver_max_iters: int = 30000
+    dccp_verbose: bool = False
+
+    # After DCCP, apply a short periodic minimum-image polish.
+    # This is the key practical step: DCCP gives a good global packing tendency,
+    # while the polish fixes cross-boundary spacing for PBC without using 3x3 DCCP.
+    dccp_post_periodic_polish: bool = True
+    dccp_post_polish_iter: int = 2500
+    dccp_post_polish_move_limit_um: float = 0.05
 
     # STEP 1: packing optimization / feasibility relaxation
     # These parameters replace the DCCP solver in a standalone SciPy-free manner.
@@ -370,6 +407,200 @@ def paper_step1_initial_optimization(
         move_limit_um=p.opt_final_move_limit_um,
     )
 
+    return centers
+
+
+
+# ============================================================
+# Optional STEP 1: non-periodic DCCP packing
+# ============================================================
+
+def get_cvxpy_solver(p: RVEParams, cp_module):
+    """Map the user solver name to a CVXPY solver constant."""
+    name = str(p.dccp_solver).upper()
+    if name == "SCS":
+        return cp_module.SCS
+    if name == "CLARABEL" and hasattr(cp_module, "CLARABEL"):
+        return cp_module.CLARABEL
+    if name == "ECOS" and hasattr(cp_module, "ECOS"):
+        return cp_module.ECOS
+    return cp_module.SCS
+
+
+def prepare_dccp_initial_value(centers: np.ndarray, radii: np.ndarray,
+                               p: RVEParams) -> np.ndarray:
+    """Prepare an initial value satisfying the selected DCCP boundary box."""
+    c0 = centers.copy()
+    c0[:, 0] = np.mod(c0[:, 0], p.Lx_um)
+    c0[:, 1] = np.mod(c0[:, 1], p.Ly_um)
+
+    if str(p.dccp_boundary_mode).lower() == "inside":
+        eps = 1.0e-6
+        c0[:, 0] = np.clip(c0[:, 0], radii + eps, p.Lx_um - radii - eps)
+        c0[:, 1] = np.clip(c0[:, 1], radii + eps, p.Ly_um - radii - eps)
+
+    return c0
+
+
+def paper_step1_dccp_nonperiodic_optimization(
+    radii: np.ndarray,
+    gap: np.ndarray,
+    p: RVEParams,
+    rng: np.random.Generator,
+    warm_start_centers: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """
+    Non-periodic DCCP version of STEP 1.
+
+    This solves the paper-like packing constraint without 3x3 periodic-image
+    constraints:
+
+        ||c_i - c_j||_2 >= r_i + r_j + dis[i,j]
+
+    Why non-periodic DCCP here?
+    - The strict periodic DCCP formulation would add 9 image constraints for
+      every fiber pair and becomes too expensive for Vf=70%, L=175 um.
+    - This function uses DCCP only to obtain a globally coordinated initial
+      packing tendency.
+    - A short periodic relaxation polish is applied afterwards when
+      p.dccp_post_periodic_polish=True, so cross-boundary spacing is corrected
+      for the final PBC-compatible RVE.
+    """
+    try:
+        import cvxpy as cp
+        import dccp  # noqa: F401
+    except ImportError as exc:
+        raise ImportError(
+            "DCCP mode requires cvxpy and dccp. Install them with:\n"
+            "    pip install cvxpy dccp\n"
+            "or:\n"
+            "    conda install -c conda-forge cvxpy\n"
+            "    pip install dccp"
+        ) from exc
+
+    import dccp
+
+    n = len(radii)
+    print("STEP 1: non-periodic DCCP packing optimization starts...")
+    print("  DCCP boundary mode       = %s" % str(p.dccp_boundary_mode))
+    print("  number of fibers         = %d" % n)
+    print("  pair constraints         = %d" % (n * (n - 1) // 2))
+    print("  strict periodic DCCP     = False")
+
+    C = cp.Variable((n, 2), name="fiber_centers")
+
+    if warm_start_centers is None:
+        centers0 = random_initial_centers(p, n, rng)
+    else:
+        centers0 = warm_start_centers.copy()
+    centers0 = prepare_dccp_initial_value(centers0, radii, p)
+    C.value = centers0
+
+    constraints = []
+    boundary_mode = str(p.dccp_boundary_mode).lower()
+    if boundary_mode == "inside":
+        constraints += [C[:, 0] >= radii, C[:, 0] <= p.Lx_um - radii]
+        constraints += [C[:, 1] >= radii, C[:, 1] <= p.Ly_um - radii]
+    elif boundary_mode == "cell":
+        constraints += [C[:, 0] >= 0.0, C[:, 0] <= p.Lx_um]
+        constraints += [C[:, 1] >= 0.0, C[:, 1] <= p.Ly_um]
+    else:
+        raise ValueError("dccp_boundary_mode must be 'cell' or 'inside'.")
+
+    # Base-cell pairwise constraints only. No periodic image constraints here.
+    for i in range(n):
+        for j in range(i + 1, n):
+            required = float(radii[i] + radii[j] + gap[i, j])
+            constraints.append(
+                cp.norm(cp.hstack([C[i, 0] - C[j, 0], C[i, 1] - C[j, 1]]), 2) >= required
+            )
+
+    objective = cp.Minimize(float(p.dccp_regularization) * cp.sum_squares(C - centers0))
+    problem = cp.Problem(objective, constraints)
+
+    if not dccp.is_dccp(problem):
+        raise RuntimeError(
+            "The constructed non-periodic packing problem is not recognized as DCCP. "
+            "Try updating cvxpy/dccp, or use step1_method='relaxation'."
+        )
+
+    solver = get_cvxpy_solver(p, cp)
+    solver_kwargs = {}
+    if str(p.dccp_solver).upper() == "SCS":
+        solver_kwargs.update({
+            "max_iters": int(p.dccp_solver_max_iters),
+            "eps": float(p.dccp_solver_eps),
+        })
+
+    try:
+        result = problem.solve(
+            method="dccp",
+            solver=solver,
+            ccp_times=int(p.dccp_ccp_times),
+            max_iter=int(p.dccp_max_iter),
+            tau=float(p.dccp_tau),
+            mu=float(p.dccp_mu),
+            tau_max=float(p.dccp_tau_max),
+            verbose=bool(p.dccp_verbose),
+            **solver_kwargs,
+        )
+    except TypeError:
+        # Some cvxpy/dccp versions accept fewer DCCP keywords.
+        result = problem.solve(
+            method="dccp",
+            solver=solver,
+            max_iter=int(p.dccp_max_iter),
+            tau=float(p.dccp_tau),
+            mu=float(p.dccp_mu),
+            verbose=bool(p.dccp_verbose),
+            **solver_kwargs,
+        )
+
+    if C.value is None:
+        raise RuntimeError("DCCP failed to return fiber coordinates.")
+
+    centers = np.asarray(C.value, dtype=float)
+    centers[:, 0] = np.mod(centers[:, 0], p.Lx_um)
+    centers[:, 1] = np.mod(centers[:, 1], p.Ly_um)
+
+    if boundary_mode == "inside":
+        centers[:, 0] = np.clip(centers[:, 0], radii, p.Lx_um - radii)
+        centers[:, 1] = np.clip(centers[:, 1], radii, p.Ly_um - radii)
+
+    print("  DCCP result/status       = %s / %s" % (str(result), str(problem.status)))
+    return centers
+
+
+def periodic_polish_after_dccp(centers: np.ndarray, radii: np.ndarray, gap: np.ndarray,
+                               p: RVEParams, rng: np.random.Generator) -> np.ndarray:
+    """
+    Short minimum-image polishing after non-periodic DCCP.
+
+    This step is intentionally much cheaper than strict periodic DCCP. It only
+    applies the existing relaxation with alpha=1.0 under the current
+    p.use_periodic_distance setting. When p.use_periodic_distance=True, it fixes
+    cross-boundary violations before re-orientation and MC shuffle.
+    """
+    if not p.dccp_post_periodic_polish:
+        return centers
+
+    print("STEP 1b: periodic polish after DCCP starts...")
+    centers = packing_relax_one_stage(
+        centers,
+        radii,
+        gap,
+        p,
+        rng,
+        alpha=1.0,
+        n_iter=int(p.dccp_post_polish_iter),
+        shake_amp=0.0,
+        move_limit_um=float(p.dccp_post_polish_move_limit_um),
+    )
+    metrics = compute_metrics(centers, radii, gap, p)
+    print(
+        "  after polish | min_margin = %.6e | max_violation = %.6e | energy = %.6e"
+        % (metrics["min_constraint_margin"], metrics["max_violation"], metrics["energy"])
+    )
     return centers
 
 
@@ -1028,13 +1259,47 @@ def evaluate_randomness(centers: np.ndarray, radii: np.ndarray, p: RVEParams, ou
 
 def generate_one_candidate(p: RVEParams, radii: np.ndarray, gap: np.ndarray,
                            rng: np.random.Generator) -> Tuple[np.ndarray, Dict[str, float]]:
-    centers = random_initial_centers(p, len(radii), rng)
-    centers = paper_step1_initial_optimization(centers, radii, gap, p, rng)
+    """
+    Generate one candidate layout.
+
+    Available STEP 1 methods:
+    - relaxation  : fast periodic relaxation only.
+    - dccp        : non-periodic DCCP + optional periodic polish.
+    - hybrid_dccp : use DCCP if possible; if DCCP fails, use the relaxation warm start.
+    """
+    method = str(p.step1_method).lower()
+
+    if method == "relaxation":
+        centers = random_initial_centers(p, len(radii), rng)
+        centers = paper_step1_initial_optimization(centers, radii, gap, p, rng)
+
+    elif method in ("dccp", "hybrid_dccp"):
+        warm = None
+        if p.dccp_use_relaxation_warm_start:
+            warm = random_initial_centers(p, len(radii), rng)
+            warm = paper_step1_initial_optimization(warm, radii, gap, p, rng)
+
+        try:
+            centers = paper_step1_dccp_nonperiodic_optimization(
+                radii, gap, p, rng, warm_start_centers=warm
+            )
+        except Exception as exc:
+            if method == "hybrid_dccp" and warm is not None:
+                print("  Warning: DCCP failed in hybrid_dccp mode. Using relaxation warm start instead.")
+                print("  DCCP error:", repr(exc))
+                centers = warm.copy()
+            else:
+                raise
+
+        centers = periodic_polish_after_dccp(centers, radii, gap, p, rng)
+
+    else:
+        raise ValueError("step1_method must be 'relaxation', 'dccp', or 'hybrid_dccp'.")
+
     centers = paper_step2_reorientation(centers, radii, gap, p, rng)
     centers = monte_carlo_shuffle(centers, radii, gap, p, rng)
     metrics = compute_metrics(centers, radii, gap, p)
     return centers, metrics
-
 
 def generate(p: RVEParams):
     if p.seed is None:
@@ -1057,6 +1322,10 @@ def generate(p: RVEParams):
     print("diameter mode    = %s" % p.diameter_mode)
     print("lmin, lmax       = %.6f, %.6f um" % (p.lmin_um, p.lmax_um))
     print("periodic metric  = %s" % str(p.use_periodic_distance))
+    print("STEP 1 method    = %s" % str(p.step1_method))
+    if str(p.step1_method).lower() in ("dccp", "hybrid_dccp"):
+        print("DCCP boundary    = %s" % str(p.dccp_boundary_mode))
+        print("post DCCP polish = %s" % str(p.dccp_post_periodic_polish))
     print("=" * 80)
 
     best_centers = None
@@ -1159,6 +1428,9 @@ def generate(p: RVEParams):
         "lmax_um": p.lmax_um,
         "valid_candidates_found": valid_found,
         "selection_mode": p.selection_mode,
+        "step1_method": p.step1_method,
+        "dccp_boundary_mode": p.dccp_boundary_mode,
+        "dccp_post_periodic_polish": p.dccp_post_periodic_polish,
         "best_randomness_score": best_score,
         "use_reorientation": p.use_reorientation,
         "reorient_passes": p.reorient_passes,
@@ -1223,6 +1495,9 @@ def make_fast_test_params() -> RVEParams:
         max_restarts=80,
         valid_candidates_to_test=3,
         selection_mode="best_valid_randomness",
+        step1_method="relaxation",
+        dccp_boundary_mode="cell",
+        dccp_post_periodic_polish=True,
         opt_alpha_steps=35,
         opt_iter_per_alpha=600,
         opt_final_iter=4000,
@@ -1267,6 +1542,10 @@ def make_paper_fig10_vf70_params() -> RVEParams:
         valid_candidates_to_test=2,
         selection_mode="best_valid_randomness",
 
+        step1_method="relaxation",
+        dccp_boundary_mode="cell",
+        dccp_post_periodic_polish=True,
+
         opt_alpha_steps=40,
         opt_iter_per_alpha=800,
         opt_final_iter=6000,
@@ -1290,64 +1569,6 @@ def make_paper_fig10_vf70_params() -> RVEParams:
     )
 
 
-def make_paper_fig10_vf80_params() -> RVEParams:
-    """
-    Vf=80% preset close to the paper's high-volume-fraction setting.
-
-    The paper uses the following inter-fiber random distance range for Vf=80%:
-        lmin = 0.100 um, lmax = 0.150 um
-
-    To keep the statistical scale consistent with the Vf=70% preset, this
-    preset uses delta = L/r = 50. With r = 3.5 um, L = 175 um.
-
-    Notes:
-    1. The estimated fiber number is about 637 for L=175 um, d=7 um, Vf=80%.
-    2. This preset keeps the relaxation-based generator only; no DCCP is added.
-    3. Vf=80% is much harder than Vf=70%, so the relaxation iterations are
-       slightly increased and the MC move amplitude is reduced.
-    """
-    return RVEParams(
-        Lx_um=175.0,
-        Ly_um=175.0,
-        target_vf=0.80,
-
-        diameter_mode="constant",
-        diameter_mean_um=7.0,
-        diameter_std_um=0.317,
-
-        lmin_um=0.100,
-        lmax_um=0.150,
-
-        max_restarts=240,
-        valid_candidates_to_test=2,
-        selection_mode="best_valid_randomness",
-
-        opt_alpha_steps=50,
-        opt_iter_per_alpha=1000,
-        opt_final_iter=9000,
-        opt_move_limit_um=0.20,
-        opt_final_move_limit_um=0.04,
-        opt_random_shake_um=0.035,
-
-        use_reorientation=True,
-        reorient_passes=1,
-        reorient_trials_per_fiber=40,
-
-        use_mc_shuffle=True,
-        mc_steps_per_fiber=150,
-        mc_move_amp_um=0.015,
-
-        use_periodic_distance=True,
-
-        pair_smooth_window=1,
-        contact_low_over_r=2.0,
-        contact_high_over_r=2.35,
-
-        seed=2026,
-        output_prefix="fiber_centers_periodic_relaxation_vf80_paper_params",
-    )
-
-
 def make_real_diameter_vf60_params() -> RVEParams:
     """
     Preset for the paper's T700/7901 validation idea: measured fiber diameter
@@ -1365,6 +1586,9 @@ def make_real_diameter_vf60_params() -> RVEParams:
         max_restarts=100,
         valid_candidates_to_test=5,
         selection_mode="best_valid_randomness",
+        step1_method="relaxation",
+        dccp_boundary_mode="cell",
+        dccp_post_periodic_polish=True,
         opt_alpha_steps=35,
         opt_iter_per_alpha=600,
         opt_final_iter=4000,
@@ -1395,16 +1619,13 @@ def build_user_params() -> RVEParams:
     # ----------------------------------------------------------------------
     # "fast_100um_vf70"     : faster test model, L=100 um, Vf=70%.
     # "paper_vf70_periodic" : formal periodic model, L=175 um, Vf=70%.
-    # "paper_vf80_periodic" : paper high-volume-fraction setting, L=175 um, Vf=80%.
     # "real_diameter_vf60"  : normal fiber diameter distribution, Vf=60%.
-    PRESET = "paper_vf80_periodic"
+    PRESET = "paper_vf70_periodic"
 
     if PRESET == "fast_100um_vf70":
         params = make_fast_test_params()
     elif PRESET == "paper_vf70_periodic":
         params = make_paper_fig10_vf70_params()
-    elif PRESET == "paper_vf80_periodic":
-        params = make_paper_fig10_vf80_params()
     elif PRESET == "real_diameter_vf60":
         params = make_real_diameter_vf60_params()
     else:
@@ -1413,7 +1634,7 @@ def build_user_params() -> RVEParams:
     # ----------------------------------------------------------------------
     # 2. Geometry and volume fraction
     # ----------------------------------------------------------------------
-    # For the paper Vf=70%/80% statistical setting, use Lx=Ly=175 um, d=7 um.
+    # For the paper Vf=70% statistical setting, use Lx=Ly=175 um, d=7 um.
     # If you change Lx/Ly/target_vf/diameter, the fiber number is recalculated.
     params.Lx_um = params.Lx_um
     params.Ly_um = params.Ly_um
@@ -1440,14 +1661,46 @@ def build_user_params() -> RVEParams:
     params.lmax_um = params.lmax_um
 
     # ----------------------------------------------------------------------
-    # 5. Periodic geometry switch for Abaqus PBC
+    # 5. STEP 1 solver method
+    # ----------------------------------------------------------------------
+    # "relaxation"  : fastest. Recommended for many repeated generations.
+    # "dccp"        : non-periodic DCCP packing + short periodic polish.
+    # "hybrid_dccp" : if DCCP fails, automatically falls back to relaxation.
+    #
+    # This DCCP is NOT the expensive 3x3 periodic-image DCCP.
+    # It is the practical version you asked for: DCCP first, then periodic polish.
+    STEP1_METHOD = "hybrid_dccp"
+    params.step1_method = STEP1_METHOD
+
+    # DCCP boundary mode:
+    # "cell"   : 0<=center<=L. Recommended if you want boundary-intersecting fibers
+    #            and periodic copies for Abaqus PBC.
+    # "inside" : r<=center<=L-r. Closer to paper Eq.(2), but all fibers stay inside.
+    params.dccp_boundary_mode = "cell"
+
+    # DCCP can still be slow for L=175 um and Vf=70%. If it is too slow,
+    # change STEP1_METHOD above to "relaxation".
+    params.dccp_max_iter = 60
+    params.dccp_solver_eps = 1.0e-4
+    params.dccp_solver_max_iters = 30000
+    params.dccp_verbose = False
+
+    # Important practical trick: after non-periodic DCCP, run a short periodic
+    # relaxation polish to remove cross-boundary violations without using strict
+    # 3x3 periodic DCCP constraints.
+    params.dccp_post_periodic_polish = True
+    params.dccp_post_polish_iter = 2500
+    params.dccp_post_polish_move_limit_um = 0.05
+
+    # ----------------------------------------------------------------------
+    # 6. Periodic geometry switch for Abaqus PBC
     # ----------------------------------------------------------------------
     # True  : use minimum-image distance. Recommended for PBC geometry.
     # False : ordinary non-periodic distance. Usually not recommended for PBC.
     params.use_periodic_distance = True
 
     # ----------------------------------------------------------------------
-    # 6. Candidate search and randomness selection
+    # 7. Candidate search and randomness selection
     # ----------------------------------------------------------------------
     # Larger valid_candidates_to_test gives a better chance of finding a curve
     # with a reasonable pair-distribution first peak, but costs more time.
@@ -1456,7 +1709,7 @@ def build_user_params() -> RVEParams:
     params.selection_mode = "best_valid_randomness"
 
     # ----------------------------------------------------------------------
-    # 7. Relaxation parameters
+    # 8. Relaxation parameters
     # ----------------------------------------------------------------------
     # Usually do not need to change these. If generation fails, increase
     # opt_iter_per_alpha or opt_final_iter.
@@ -1465,7 +1718,7 @@ def build_user_params() -> RVEParams:
     params.opt_final_iter = params.opt_final_iter
 
     # ----------------------------------------------------------------------
-    # 8. Re-orientation parameters
+    # 9. Re-orientation parameters
     # ----------------------------------------------------------------------
     # Too strong re-orientation may make the layout overly regular.
     # A practical setting is passes=2, trials=60, then use a small MC shuffle.
@@ -1474,7 +1727,7 @@ def build_user_params() -> RVEParams:
     params.reorient_trials_per_fiber = params.reorient_trials_per_fiber
 
     # ----------------------------------------------------------------------
-    # 9. Optional legal Monte Carlo shuffle
+    # 10. Optional legal Monte Carlo shuffle
     # ----------------------------------------------------------------------
     # This does not break spacing constraints. It helps reduce artificial
     # near-contact pile-up from the relaxation step.
@@ -1483,7 +1736,7 @@ def build_user_params() -> RVEParams:
     params.mc_move_amp_um = params.mc_move_amp_um
 
     # ----------------------------------------------------------------------
-    # 10. Pair distribution settings
+    # 11. Pair distribution settings
     # ----------------------------------------------------------------------
     # First bin = [pair_h_min_over_r, pair_h_min_over_r + pair_dh_over_r].
     # Therefore, if pair_h_min_over_r=2.0 and pair_dh_over_r=0.35, set
@@ -1498,11 +1751,11 @@ def build_user_params() -> RVEParams:
     params.pair_smooth_window = 1
 
     # ----------------------------------------------------------------------
-    # 11. Random seed and output name
+    # 12. Random seed and output name
     # ----------------------------------------------------------------------
     # seed=None gives a new RVE every run. seed=2026 reproduces the same RVE.
     params.seed = 2026
-    params.output_prefix = params.output_prefix
+    params.output_prefix = "fiber_centers_hybrid_dccp_periodic_vf70"
 
     return params
 
