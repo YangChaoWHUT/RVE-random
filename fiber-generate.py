@@ -103,8 +103,8 @@ class RVEParams:
 
     # Distance checking
     use_periodic_distance: bool = True
-    tol_um: float = 1.0e-7
-
+    tol_um: float = 1.0e-5
+#    tol_um: float = 1.0e-7
     # Randomness evaluation settings
     pair_h_min_over_r: float = 2.0
     pair_h_max_over_r: float = 15.0
